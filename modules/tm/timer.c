@@ -111,7 +111,9 @@
 #include "t_funcs.h"
 #include "t_reply.h"
 #include "t_cancel.h"
+#include "t_lookup.h"
 #include "t_stats.h"
+#include <stdint.h>
 
 
 static struct timer_table *timertable=0;
@@ -201,28 +203,28 @@ static void delete_cell( struct cell *p_cell, int unlock )
 		abort();
 	}
 	for (i=0; i<p_cell->nr_of_outgoings; i++) {
-		if (is_in_timer_list2(& p_cell->uac[i].request.retr_timer)) {
+		if (is_in_timer_list2(&TM_BRANCH(p_cell, i).request.retr_timer)) {
 			LM_ERR("transaction %p scheduled for deletion and still on RETR "
 				"(req %d), timeout %lld\n", p_cell, i,
-				p_cell->uac[i].request.retr_timer.time_out);
+				TM_BRANCH(p_cell, i).request.retr_timer.time_out);
 			abort();
 		}
-		if (is_in_timer_list2(& p_cell->uac[i].request.fr_timer)) {
+		if (is_in_timer_list2(&TM_BRANCH(p_cell, i).request.fr_timer)) {
 			LM_ERR("transaction %p scheduled for deletion and"
 				" still on FR (req %d), timeout %lld\n", p_cell, i,
-				p_cell->uac[i].request.fr_timer.time_out);
+				TM_BRANCH(p_cell, i).request.fr_timer.time_out);
 			abort();
 		}
-		if (is_in_timer_list2(& p_cell->uac[i].local_cancel.retr_timer)) {
+		if (is_in_timer_list2(&TM_BRANCH(p_cell, i).local_cancel.retr_timer)) {
 			LM_ERR("transaction %p scheduled for deletion and"
 				" still on RETR/cancel (req %d), timeout %lld\n", p_cell, i,
-				p_cell->uac[i].request.retr_timer.time_out);
+				TM_BRANCH(p_cell, i).local_cancel.retr_timer.time_out);
 			abort();
 		}
-		if (is_in_timer_list2(& p_cell->uac[i].local_cancel.fr_timer)) {
+		if (is_in_timer_list2(&TM_BRANCH(p_cell, i).local_cancel.fr_timer)) {
 			LM_ERR("transaction %p scheduled for deletion and"
 				" still on FR/cancel (req %d), timeout %lld\n", p_cell, i,
-				p_cell->uac[i].request.fr_timer.time_out);
+				TM_BRANCH(p_cell, i).local_cancel.fr_timer.time_out);
 			abort();
 		}
 	}
@@ -248,19 +250,19 @@ static void delete_cell( struct cell *p_cell, int unlock )
  * a non-200OK reply, it cannot lead to a cancelling scenario */
 static void fake_reply(struct cell *t, int branch, int code )
 {
-	branch_bm_t cancel_bitmap = 0;
+	branch_bm_t cancel_bitmap = BRANCH_BM_ZERO;
 	enum rps reply_status;
 
 	_tm_branch_index = branch;
 	if ( is_local(t) ) {
 		reply_status=local_reply( t, FAKED_REPLY, branch,
-					  code, &cancel_bitmap );
+					  code, cancel_bitmap );
 		if (reply_status==RPS_COMPLETED) {
 			put_on_wait(t);
 		}
 	} else {
 		reply_status=relay_reply( t, FAKED_REPLY, branch, code,
-			&cancel_bitmap );
+			cancel_bitmap );
 	}
 	_tm_branch_index = 0;
 	/* again, a final negative reply on a branch will never lead to a
@@ -272,6 +274,36 @@ static void fake_reply(struct cell *t, int branch, int code )
 
 
 
+
+
+void tm_tcp_chunk_fail(void *param)
+{
+	unsigned long long token = (unsigned long long)(uintptr_t)param;
+	unsigned int hash_index = (token >> 9) & 0xffff;
+	unsigned int label = token >> 25;
+	int branch = (int)(token & 0x1ff) - 1;
+	struct cell *t;
+
+	if (t_lookup_ident(&t, hash_index, label) < 0)
+		return;
+
+	if (push_new_global_context()) {
+		set_t(t);
+
+		LOCK_REPLIES(t);
+		if (branch >= t->nr_of_outgoings ||
+		TM_BRANCH(t,branch).last_received != 0 ||
+		TM_BRANCH(t,branch).request.buffer.s == NULL)
+			UNLOCK_REPLIES(t);
+		else
+			fake_reply(t, branch, -E_SEND);
+
+		init_t();
+		pop_pushed_global_context();
+	}
+
+	UNREF(t);
+}
 
 
 inline static void retransmission_handler( struct timer_link *retr_tl )
@@ -310,10 +342,14 @@ inline static void retransmission_handler( struct timer_link *retr_tl )
 
 			set_t(T_UNDEFINED);
 			switch(r_buf->retr_list) {
-			case RT_T1_TO_1: update_stat( tm_retran_req_T11, 1); break;
-			case RT_T1_TO_2: update_stat( tm_retran_req_T12, 1); break;
-			case RT_T1_TO_3: update_stat( tm_retran_req_T13, 1); break;
-			case RT_T2: update_stat( tm_retran_req_T2, 1);break;
+			case RT_T1_TO_1:
+				if_update_stat(tm_enable_stats, tm_retran_req_T11, 1); break;
+			case RT_T1_TO_2:
+				if_update_stat(tm_enable_stats, tm_retran_req_T12, 1); break;
+			case RT_T1_TO_3:
+				if_update_stat(tm_enable_stats, tm_retran_req_T13, 1); break;
+			case RT_T2:
+				if_update_stat(tm_enable_stats, tm_retran_req_T2, 1);break;
 			default:;
 			}
 	} else {
@@ -322,7 +358,7 @@ inline static void retransmission_handler( struct timer_link *retr_tl )
 			set_t(r_buf->my_T);
 			t_retransmit_reply(r_buf->my_T);
 			set_t(T_UNDEFINED);
-			update_stat( tm_retran_rpl_T2, 1);
+			if_update_stat(tm_enable_stats, tm_retran_rpl_T2, 1);
 	}
 
 	id = r_buf->retr_list;
@@ -346,7 +382,7 @@ inline static void final_response_handler( struct timer_link *fr_tl )
 	context_p old_ctx;
 	struct retr_buf* r_buf;
 	struct cell *t;
-	branch_bm_t cancel_bitmap;
+	branch_bm_t cancel_bitmap = BRANCH_BM_ZERO;
 
 	if (fr_tl==0){
 		/* or BUG?, ignoring it for now */
@@ -406,7 +442,7 @@ inline static void final_response_handler( struct timer_link *fr_tl )
 
 	/* out-of-lock do the cancel I/O */
 	if (is_invite(t) && should_cancel_branch(t, r_buf->branch) ) {
-		cancel_bitmap =  1 << r_buf->branch ;
+		BRANCH_BM_SET_IDX( cancel_bitmap, r_buf->branch) ;
 		set_cancel_extra_hdrs( CANCEL_REASON_SIP_480,
 			sizeof(CANCEL_REASON_SIP_480)-1);
 		cancel_uacs(t, cancel_bitmap );
@@ -414,8 +450,10 @@ inline static void final_response_handler( struct timer_link *fr_tl )
 	}
 
 	switch(r_buf->retr_list) {
-	case FR_TIMER_LIST: update_stat( tm_timeout_fr, 1); break;
-	case FR_INV_TIMER_LIST: update_stat( tm_timeout_fr_inv, 1); break;
+	case FR_TIMER_LIST:
+		if_update_stat(tm_enable_stats, tm_timeout_fr, 1); break;
+	case FR_INV_TIMER_LIST:
+		if_update_stat(tm_enable_stats, tm_timeout_fr_inv, 1); break;
 	default:;
 	}
 	/* lock reply processing to determine how to proceed reliably */
@@ -442,8 +480,8 @@ void cleanup_localcancel_timers( struct cell *t )
 {
 	int i;
 	for (i=0; i<t->nr_of_outgoings; i++ )  {
-		reset_timer(  &t->uac[i].local_cancel.retr_timer );
-		reset_timer(  &t->uac[i].local_cancel.fr_timer );
+		reset_timer(  &TM_BRANCH(t,i).local_cancel.retr_timer );
+		reset_timer(  &TM_BRANCH(t,i).local_cancel.fr_timer );
 	}
 }
 
@@ -1028,15 +1066,15 @@ static void unlink_timers( struct cell *t )
 	*/
 	if (is_in_timer_list2(&t->uas.response.fr_timer)) remove_fr=1;
 	else for (i=0; i<t->nr_of_outgoings; i++)
-		if (is_in_timer_list2(&t->uac[i].request.fr_timer)
-			|| is_in_timer_list2(&t->uac[i].local_cancel.fr_timer)) {
+		if (is_in_timer_list2(&TM_BRANCH(t,i).request.fr_timer)
+			|| is_in_timer_list2(&TM_BRANCH(t,i).local_cancel.fr_timer)) {
 				remove_fr=1;
 				break;
 		}
 	if (is_in_timer_list2(&t->uas.response.retr_timer)) remove_retr=1;
 	else for (i=0; i<t->nr_of_outgoings; i++)
-		if (is_in_timer_list2(&t->uac[i].request.retr_timer)
-			|| is_in_timer_list2(&t->uac[i].local_cancel.retr_timer)) {
+		if (is_in_timer_list2(&TM_BRANCH(t,i).request.retr_timer)
+			|| is_in_timer_list2(&TM_BRANCH(t,i).local_cancel.retr_timer)) {
 				remove_retr=1;
 				break;
 		}
@@ -1051,8 +1089,8 @@ static void unlink_timers( struct cell *t )
 		lock(timertable[set].timers[RT_T1_TO_1].mutex);
 		remove_timer_unsafe(&t->uas.response.retr_timer);
 		for (i=0; i<t->nr_of_outgoings; i++) {
-			remove_timer_unsafe(&t->uac[i].request.retr_timer);
-			remove_timer_unsafe(&t->uac[i].local_cancel.retr_timer);
+			remove_timer_unsafe(&TM_BRANCH(t,i).request.retr_timer);
+			remove_timer_unsafe(&TM_BRANCH(t,i).local_cancel.retr_timer);
 		}
 		unlock(timertable[set].timers[RT_T1_TO_1].mutex);
 	}
@@ -1063,8 +1101,8 @@ static void unlink_timers( struct cell *t )
 		lock(timertable[set].timers[FR_TIMER_LIST].mutex);
 		remove_timer_unsafe(&t->uas.response.fr_timer);
 		for (i=0; i<t->nr_of_outgoings; i++) {
-			remove_timer_unsafe(&t->uac[i].request.fr_timer);
-			remove_timer_unsafe(&t->uac[i].local_cancel.fr_timer);
+			remove_timer_unsafe(&TM_BRANCH(t,i).request.fr_timer);
+			remove_timer_unsafe(&TM_BRANCH(t,i).local_cancel.fr_timer);
 		}
 		unlock(timertable[set].timers[FR_TIMER_LIST].mutex);
 	}

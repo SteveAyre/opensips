@@ -51,17 +51,6 @@ int db_mode = 1;
 int clusterer_enable_rerouting = 1;
 
 str clusterer_db_url = {NULL, 0};
-str db_table = str_init("clusterer");
-str id_col = str_init("id");	/* PK column */
-str cluster_id_col = str_init("cluster_id");
-str node_id_col = str_init("node_id");
-str url_col = str_init("url");
-str state_col = str_init("state");
-str no_ping_retries_col = str_init("no_ping_retries");
-str priority_col = str_init("priority");
-str sip_addr_col = str_init("sip_addr");
-str flags_col = str_init("flags");
-str description_col = str_init("description");
 
 extern db_con_t *db_hdl;
 extern db_func_t dr_dbf;
@@ -148,22 +137,23 @@ static const cmd_export_t cmds[] = {
  * Exported parameters
  */
 static const param_export_t params[] = {
-	{"enable_stats",		INT_PARAM,  &clusterer_enable_stats	},
+	{"enable_stats",		INT_PARAM,	&clusterer_enable_stats	},
 	{"db_url",				STR_PARAM,	&clusterer_db_url.s	},
 	{"db_table",			STR_PARAM,	&db_table.s			},
+	{"db_bridges_table",	STR_PARAM,	&db_bridges_table.s	},
 	{"my_node_id",			INT_PARAM,	&current_id			},
 	{"ping_interval",		INT_PARAM,	&ping_interval		},
 	{"node_timeout",		INT_PARAM,	&node_timeout		},
 	{"ping_timeout",		INT_PARAM,	&ping_timeout		},
 	{"seed_fallback_interval", INT_PARAM, &seed_fb_interval	},
-	{"sync_timeout",        INT_PARAM,  &sync_timeout		},
+	{"sync_timeout",		INT_PARAM,	&sync_timeout		},
 	{"id_col",				STR_PARAM,	&id_col.s			},
 	{"cluster_id_col",		STR_PARAM,	&cluster_id_col.s	},
 	{"node_id_col",			STR_PARAM,	&node_id_col.s		},
 	{"url_col",				STR_PARAM,	&url_col.s			},
 	{"state_col",			STR_PARAM,	&state_col.s		},
 	{"no_ping_retries_col",	STR_PARAM,	&no_ping_retries_col.s	},
-	{"priority_col",		STR_PARAM,  &priority_col.s		},
+	{"priority_col",		STR_PARAM,	&priority_col.s		},
 	{"sip_addr_col",		STR_PARAM,	&sip_addr_col.s		},
 	{"flags_col",			STR_PARAM,	&flags_col.s		},
 	{"description_col",		STR_PARAM,	&description_col.s	},
@@ -182,54 +172,54 @@ static const param_export_t params[] = {
 
 /*
  * Exported MI functions
- */	
+ */
 static const mi_export_t mi_cmds[] = {
-	{ "clusterer_reload", "reloads stored data from the database", 0,0,{
+	{ "reload", "reloads stored data from the database", 0,0, {
 		{clusterer_reload, {0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"clusterer_reload", 0}
 	},
-	{ "clusterer_set_status", "sets the status for a specified connection", 0,0,{
+	{ "set_status", "sets the status for a specified connection", 0,0, {
 		{clusterer_set_status, {"cluster_id", "status", 0}},
 		{clusterer_set_status, {"cluster_id", "node_id", "status", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"clusterer_set_status", 0}
 	},
-	{ "clusterer_list", "lists the available connections for the specified server", 0,0,{
+	{ "list", "lists the available connections for the specified server", 0,0, {
 		{clusterer_list, {0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"clusterer_list", 0}
 	},
-	{ "clusterer_list_topology", "lists the topology as known by the current node", 0,0,{
+	{ "list_topology", "lists the topology as known by the current node", 0,0, {
 		{clusterer_list_topology, {0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"clusterer_list_topology", 0}
 	},
-	{ "cluster_send_mi", "sends an MI command to be run on a specific node in a cluster", 0,0,{
+	{ "send_mi", "sends an MI command to be run on a specific node in a cluster", 0,0, {
 		{cluster_send_mi, {"cluster_id", "destination", "cmd_name", 0}},
 		{cluster_send_mi, {"cluster_id", "destination", "cmd_name", "cmd_params", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"cluster_send_mi", 0}
 	},
-	{ "cluster_broadcast_mi", "dispatches an MI command to be run on all nodes in a cluster", 0,0,{
+	{ "broadcast_mi", "dispatches an MI command to be run on all nodes in a cluster", 0,0, {
 		{cluster_bcast_mi, {"cluster_id", "cmd_name", 0}},
 		{cluster_bcast_mi, {"cluster_id", "cmd_name", "cmd_params", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"cluster_broadcast_mi", 0}
 	},
-	{ "clusterer_list_cap", "lists registered capabilities and their states", 0,0,{
+	{ "list_cap", "lists registered capabilities and their states", 0,0, {
 		{clusterer_list_cap, {0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"clusterer_list_cap", 0}
 	},
-	{ "clusterer_set_cap_status", "sets the status for a capability", 0,0,{
+	{ "set_cap_status", "sets the status for a capability", 0,0, {
 		{clusterer_set_cap_status, {"cluster_id", "capability", "status", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"clusterer_set_cap_status", 0}
 	},
-	{ "clusterer_list_shtags", "lists the sharing tags and their states", 0,0,{
+	{ "list_shtags", "lists the sharing tags and their states", 0,0, {
 		{shtag_mi_list, {0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"clusterer_list_shtags", 0}
 	},
-	{ "clusterer_shtag_set_active", "switch the status of the give sharing tag to active", 0,0,{
+	{ "shtag_set_active", "switch the status of the give sharing tag to active", 0,0, {
 		{shtag_mi_set_active, {"tag", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"clusterer_shtag_set_active", 0}
 	},
-	{ "clusterer_remove_node", "removes a node from the cluster", 0,0,{
+	{ "remove_node", "removes a node from the cluster", 0,0, {
 		{cluster_remove_node, {"cluster_id", "node_id", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"clusterer_remove_node", 0}
 	},
 	{EMPTY_MI_EXPORT}
 };
@@ -387,6 +377,7 @@ static int mod_init(void)
 	LM_INFO("Clusterer module - initializing\n");
 
 	db_table.len = strlen(db_table.s);
+	db_bridges_table.len = strlen(db_bridges_table.s);
 	id_col.len = strlen(id_col.s);
 	cluster_id_col.len = strlen(cluster_id_col.s);
 	node_id_col.len = strlen(node_id_col.s);
@@ -476,7 +467,7 @@ static int mod_init(void)
 			LM_ERR("cannot initialize database connection\n");
 			goto error;
 		}
-		if (load_db_info(&dr_dbf, db_hdl, &db_table, cluster_list) != 0) {
+		if (load_db_info(&dr_dbf, db_hdl, cluster_list) != 0) {
 			LM_ERR("Failed to load info from DB\n");
 			goto error;
 		}
@@ -582,7 +573,7 @@ mi_response_t *clusterer_reload(const mi_params_t *params,
 		return init_mi_error(400, MI_SSTR("Non-DB mode"));
 	}
 
-	if (load_db_info(&dr_dbf, db_hdl, &db_table, &new_info) != 0) {
+	if (load_db_info(&dr_dbf, db_hdl, &new_info) != 0) {
 		LM_ERR("Failed to load info from DB\n");
 		return init_mi_error(500, MI_SSTR("Failed to reload"));
 	}
@@ -760,7 +751,7 @@ static mi_response_t *clusterer_list(const mi_params_t *params,
 
 			lock_release(n_info->lock);
 
-			n_hop = get_next_hop(n_info); 
+			n_hop = get_next_hop(n_info);
 			if (!n_hop)
 				val = str_none;
 			else
@@ -1419,8 +1410,10 @@ int load_clusterer(struct clusterer_binds *binds)
 	binds->get_my_id = cl_get_my_id;
 	binds->get_my_sip_addr = cl_get_my_sip_addr;
 	binds->get_my_index = cl_get_my_index;
+	binds->has_bridge = has_bridge;
 	binds->send_to = cl_send_to;
 	binds->send_all = cl_send_all;
+	binds->send_all_bridges = cl_send_all_bridges;
 	binds->send_all_having = cl_send_all_having;
 	binds->get_next_hop = api_get_next_hop;
 	binds->free_next_hop = api_free_next_hop;

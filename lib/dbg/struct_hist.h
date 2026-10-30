@@ -24,6 +24,10 @@
 #include "../../timer.h"
 #include "../../mem/mem_funcs.h"
 
+#ifdef BACKTRACE_DBG
+#define SH_BACKTRACE_SIZE 16
+#endif
+
 /**
  * Generic struct debugging support.  Some major use cases:
  *   - troubleshooting bugs related to reference counted structures, including:
@@ -45,7 +49,7 @@
  *    remain available inside the global history list for a while
  */
 
-#define MAX_SHLOG_SIZE 80 /* longer log lines will get truncated */
+#define MAX_SHLOG_SIZE 128 /* longer log lines will get truncated */
 
 /**
  * To be freely extended by any piece of OpenSIPS code which makes use of
@@ -56,6 +60,8 @@
 	VERB_FUN(TCP_SEND2MAIN) \
 	VERB_FUN(TCP_ADD_READER) \
 	VERB_FUN(TCP_REF) \
+	VERB_FUN(TCP_RELEASED) \
+	VERB_FUN(TCP_DEL_DELAY) \
 	VERB_FUN(TCP_UNREF) \
 	VERB_FUN(TCP_DESTROY) \
 	VERB_FUN(DLG_REF) \
@@ -79,6 +85,10 @@ struct struct_hist_action {
 	enum struct_hist_verb verb;
 	utime_t t;
 	int pid;
+#ifdef BACKTRACE_DBG
+	int bt_size;
+	void *bt[SH_BACKTRACE_SIZE];
+#endif
 	char log[MAX_SHLOG_SIZE];
 };
 

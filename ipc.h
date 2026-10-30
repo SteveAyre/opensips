@@ -128,8 +128,22 @@ void ipc_handle_job(int fd);
 void ipc_handle_all_pending_jobs(int fd);
 
 
+/*
+ * A way of checking whether a process is already running within a
+ * ipc_dispatch_rpc() context, in order to avoid double async dispatching,
+ * which is effectively a waste of resources.
+ */
+extern int ipc_running_rpc_job;
+static inline int ipc_is_async_dispatch(void) { return ipc_running_rpc_job; }
+
+
 /* internal functions */
 int init_ipc(void);
+
+
+/* Best-effort increase of a pipe's capacity up to the requested size.
+ * Returns the resulting capacity, or -1 if it cannot be inspected. */
+int enlarge_pipe(int fd, int target_size);
 
 
 int create_ipc_pipes(int proc_no);

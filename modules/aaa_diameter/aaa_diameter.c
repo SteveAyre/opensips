@@ -19,6 +19,7 @@
  */
 
 #include <freeDiameter/extension.h>
+#include <stdint.h>
 
 #include "../../sr_module.h"
 #include "../../lib/list.h"
@@ -51,6 +52,7 @@ str dm_realm = str_init("diameter.test");
 str dm_peer_identity = str_init("server"); /* a.k.a. server.diameter.test */
 static str dm_aaa_url = {NULL, 0};
 int dm_answer_timeout = 2000; /* ms */
+int dm_max_json_log_size   = 512;
 int dm_server_autoreply_error; /* ensures we always reply with *something* */
 
 static const cmd_export_t cmds[]= {
@@ -92,14 +94,14 @@ static const param_export_t params[] =
 	{ "peer_identity",   STR_PARAM, &dm_peer_identity.s  },
 	{ "aaa_url",         STR_PARAM, &dm_aaa_url.s        },
 	{ "answer_timeout",   INT_PARAM, &dm_answer_timeout  },
+	{ "max_json_log_size",INT_PARAM, &dm_max_json_log_size},
 	{ NULL, 0, NULL },
 };
 
 static const mi_export_t mi_cmds[] = {
 	{ "fd_log_level", 0, 0, 0, {
 		{NULL, {"log_level", 0}},
-		{EMPTY_MI_RECIPE}}
-	},
+		{EMPTY_MI_RECIPE}}, {0}},
 	{EMPTY_MI_EXPORT}
 };
 
@@ -269,7 +271,15 @@ static int dm_bind_api(diameter_api *api)
 }
 
 
-
+#define LM_ERR_DM_JSON(_err, _j) \
+	do { \
+		if ((_j)->len > dm_max_json_log_size) \
+			LM_ERR(_err " ('%.*s' ..., total: %d)\n", \
+					dm_max_json_log_size, (_j)->s, (_j)->len); \
+		else \
+			LM_ERR(_err " ('%.*s', len: %d)\n", \
+					(_j)->len, (_j)->s, (_j)->len); \
+	} while (0)
 static int dm_send_request(struct sip_msg *msg, int *app_id, int *cmd_code,
 				str *avp_json, pv_spec_t *rpl_avps_pv)
 {
@@ -297,14 +307,12 @@ static int dm_send_request(struct sip_msg *msg, int *app_id, int *cmd_code,
 
 	avps = cJSON_Parse(avp_json->s);
 	if (!avps) {
-		LM_ERR("failed to parse input JSON ('%.*s' ..., total: %d)\n",
-		       avp_json->len > 512 ? 512 : avp_json->len, avp_json->s, avp_json->len);
+		LM_ERR_DM_JSON("failed to parse input JSON", avp_json);
 		return -1;
 	}
 
 	if (avps->type != cJSON_Array) {
-		LM_ERR("bad JSON type: must be Array ('%.*s' ..., total: %d)\n",
-		       avp_json->len > 512 ? 512 : avp_json->len, avp_json->s, avp_json->len);
+		LM_ERR_DM_JSON("bad JSON type: must be Array", avp_json);
 		goto error;
 	}
 
@@ -316,23 +324,22 @@ static int dm_send_request(struct sip_msg *msg, int *app_id, int *cmd_code,
 
 	if (dm_build_avps(&((struct dm_message *)(dmsg->avpair))->avps,
 	                     avps->child) != 0) {
-		LM_ERR("failed to unpack JSON ('%.*s' ..., total: %d)\n",
-		       avp_json->len > 512 ? 512 : avp_json->len, avp_json->s, avp_json->len);
+		LM_ERR_DM_JSON("failed to unpack JSON", avp_json);
 		_dm_destroy_message(dmsg);
 		goto error;
 	}
 	cJSON_Delete(avps);
 
 	if (_dm_send_message(NULL, dmsg, &rpl) != 0)
-		goto error;
+		goto ret;
 	rc = _dm_get_message_response(rpl, (rpl_avps_pv?&rpl_avps:NULL));
 
 	if (rpl_avps_pv) {
 		pv_value_t val = {(str){rpl_avps, strlen(rpl_avps)}, 0, PV_VAL_STR};
 		if (pv_set_value(msg, rpl_avps_pv, 0, &val) != 0)
 			LM_ERR("failed to set output rpl_avps pv to: %s\n", rpl_avps);
-		_dm_release_message_response(rpl, rpl_avps);
 	}
+	_dm_release_message_response(rpl, rpl_avps);
 
 	if (rc != 0) {
 		LM_ERR("Diameter request failed (rc: %d)\n", rc);
@@ -342,13 +349,14 @@ static int dm_send_request(struct sip_msg *msg, int *app_id, int *cmd_code,
 	return 1;
 
 error:
+	cJSON_Delete(avps);
+ret:
 	if (rpl_avps_pv) {
 		pv_value_t val = {STR_NULL, 0, PV_VAL_NULL};
 		if (pv_set_value(msg, rpl_avps_pv, 0, &val) != 0)
 			LM_ERR("failed to set output rpl_avps pv to NULL\n");
 	}
 
-	cJSON_Delete(avps);
 	return -1;
 }
 
@@ -376,14 +384,12 @@ static int dm_send_answer(struct sip_msg *msg, str *avp_json, int *is_error)
 
 	avps = cJSON_Parse(avp_json->s);
 	if (!avps) {
-		LM_ERR("failed to parse input JSON ('%.*s' ..., total: %d)\n",
-		       avp_json->len > 512 ? 512 : avp_json->len, avp_json->s, avp_json->len);
+		LM_ERR_DM_JSON("failed to parse input JSON", avp_json);
 		return -1;
 	}
 
 	if (avps->type != cJSON_Array) {
-		LM_ERR("bad JSON type: must be Array ('%.*s' ..., total: %d)\n",
-		       avp_json->len > 512 ? 512 : avp_json->len, avp_json->s, avp_json->len);
+		LM_ERR_DM_JSON("bad JSON type: must be Array", avp_json);
 		goto error;
 	}
 
@@ -420,7 +426,8 @@ static int dm_send_answer(struct sip_msg *msg, str *avp_json, int *is_error)
 		reverse_hex2int64(res.rs.s, res.rs.len, 1, &fd_req);
 	}
 
-	dmsg = _dm_create_message(NULL, AAA_CUSTOM_RPL, appid, cmdcode, (void *)fd_req);
+	dmsg = _dm_create_message(NULL, AAA_CUSTOM_RPL, appid, cmdcode,
+		(void *)(uintptr_t)fd_req);
 	if (!dmsg) {
 		LM_ERR("oom\n");
 		goto error;
@@ -431,8 +438,7 @@ static int dm_send_answer(struct sip_msg *msg, str *avp_json, int *is_error)
 		dm->error_bit = 1;
 
 	if (dm_build_avps(&dm->avps, avps->child) != 0) {
-		LM_ERR("failed to unpack JSON ('%.*s' ..., total: %d)\n",
-		       avp_json->len > 512 ? 512 : avp_json->len, avp_json->s, avp_json->len);
+		LM_ERR_DM_JSON("failed to unpack JSON", avp_json);
 		goto error;
 	}
 
@@ -468,21 +474,22 @@ struct dm_async_msg {
 	struct dm_cond *cond;
 };
 
-static struct dm_async_msg *dm_get_async_msg(pv_spec_t *rpl_avps_pv, aaa_message *dmsg)
+static struct dm_async_msg *dm_get_async_msg(pv_spec_t *rpl_avps_pv, struct dm_cond *cond)
 {
 	struct dm_async_msg *msg = pkg_malloc(sizeof *msg);
 	if (!msg)
 		return NULL;
 	memset(msg, 0, sizeof *msg);
 	msg->ret = rpl_avps_pv;
-	msg->cond = ((struct dm_message *)(dmsg->avpair))->reply_cond;
+	msg->cond = cond;
+	dm_cond_ref(cond);
 	return msg;
 }
 
 static void dm_free_sync_msg(struct dm_async_msg *amsg)
 {
 	if (amsg->cond)
-		shm_free(amsg->cond);
+		dm_cond_unref(amsg->cond);
 	pkg_free(amsg);
 }
 
@@ -516,8 +523,7 @@ static int dm_send_request_async_reply(int fd,
 error:
 	if (amsg->ret && pv_set_value(msg, amsg->ret, 0, &val) != 0)
 		LM_ERR("failed to set output rpl_avps pv to NULL\n");
-	if (rpl_avps)
-		_dm_release_message_response(amsg->cond, rpl_avps);
+	_dm_release_message_response(amsg->cond, rpl_avps);
 	dm_free_sync_msg(amsg);
 	return ret;
 }
@@ -525,11 +531,18 @@ error:
 static int dm_send_request_async_tout(int fd,
 		struct sip_msg *msg, void *param)
 {
+	int removed;
 	struct dm_async_msg *amsg = (struct dm_async_msg *)param;
 	pv_value_t val = {STR_NULL, 0, PV_VAL_NULL};
 
+	async_status = ASYNC_DONE_CLOSE_FD;
+
 	if (pv_set_value(msg, amsg->ret, 0, &val) != 0)
 		LM_ERR("failed to set output rpl_avps pv to NULL\n");
+
+	removed = dm_drop_pending_reply_cond(amsg->cond);
+	if (removed > 0)
+		dm_cond_unref(amsg->cond);
 
 	dm_free_sync_msg(amsg);
 	return -2;
@@ -542,6 +555,7 @@ static int dm_send_request_async(struct sip_msg *msg, async_ctx *ctx,
 	struct dict_object *req;
 	cJSON *avps;
 	struct dm_async_msg *amsg;
+	struct dm_cond *cond;
 
 	if (fd_dict_search(fd_g_config->cnf_dict, DICT_COMMAND, CMD_BY_CODE_R,
 	      cmd_code, &req, ENOENT) == ENOENT) {
@@ -560,14 +574,12 @@ static int dm_send_request_async(struct sip_msg *msg, async_ctx *ctx,
 
 	avps = cJSON_Parse(avp_json->s);
 	if (!avps) {
-		LM_ERR("failed to parse input JSON ('%.*s' ..., total: %d)\n",
-		       avp_json->len > 512 ? 512 : avp_json->len, avp_json->s, avp_json->len);
+		LM_ERR_DM_JSON("failed to parse input JSON", avp_json);
 		return -1;
 	}
 
 	if (avps->type != cJSON_Array) {
-		LM_ERR("bad JSON type: must be Array ('%.*s' ..., total: %d)\n",
-		       avp_json->len > 512 ? 512 : avp_json->len, avp_json->s, avp_json->len);
+		LM_ERR_DM_JSON("bad JSON type: must be Array", avp_json);
 		goto error;
 	}
 
@@ -579,22 +591,21 @@ static int dm_send_request_async(struct sip_msg *msg, async_ctx *ctx,
 
 	if (dm_build_avps(&((struct dm_message *)(dmsg->avpair))->avps,
 	                     avps->child) != 0) {
-		LM_ERR("failed to unpack JSON ('%.*s' ..., total: %d)\n",
-		       avp_json->len > 512 ? 512 : avp_json->len, avp_json->s, avp_json->len);
+		LM_ERR_DM_JSON("failed to unpack JSON", avp_json);
 		_dm_destroy_message(dmsg);
 		goto error;
 	}
-	if (_dm_send_message_async(NULL, dmsg, &async_status) < 0) {
+	if (_dm_send_message_async(NULL, dmsg, &async_status, &cond) < 0) {
 		LM_ERR("cannot send async message!\n");
 		goto error;
 	}
 
-	amsg = dm_get_async_msg(rpl_avps_pv, dmsg);
+	amsg = dm_get_async_msg(rpl_avps_pv, cond);
 	if (!amsg)
 		goto error;
 	cJSON_Delete(avps);
 
-	ctx->resume_f = dm_send_request_async_reply;
+	ASYNC_SET_RESUME_F(ctx, dm_send_request_async_reply);
 	ctx->resume_param = amsg;
 	ctx->timeout_s = dm_answer_timeout / 1000;
 	ctx->timeout_f = dm_send_request_async_tout;

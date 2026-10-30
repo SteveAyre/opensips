@@ -108,8 +108,11 @@ static int fixup_json_bind(void**);
 static int pv_set_json (struct sip_msg*,  pv_param_t*, int , pv_value_t* );
 static int pv_get_json (struct sip_msg*,  pv_param_t*, pv_value_t* );
 static int pv_get_json_compact(struct sip_msg*,  pv_param_t*, pv_value_t* );
+static int pv_get_json_compact_noescape(struct sip_msg*,  pv_param_t*, pv_value_t* );
 static int pv_get_json_pretty(struct sip_msg*,  pv_param_t*, pv_value_t* );
 static int pv_get_json_ext(struct sip_msg*,  pv_param_t*, pv_value_t* , int flags);
+static int pv_get_json_true(struct sip_msg*, pv_param_t*, pv_value_t*);
+static int pv_get_json_false(struct sip_msg*, pv_param_t*, pv_value_t*);
 static int json_bind(struct sip_msg* , pv_spec_t* , pv_spec_t* );
 static void print_tag_list( json_tag *, json_tag *, int);
 static json_t *get_object(pv_json_t *, pv_param_t *, json_tag **, int, int);
@@ -142,14 +145,36 @@ static const param_export_t mod_params[]={
 
 
 static const pv_export_t mod_items[] = {
+	{ str_const_init("json_true"), PVT_JSON, pv_get_json_true,
+		0, 0, 0, 0, 0},
+	{ str_const_init("json_false"), PVT_JSON, pv_get_json_false,
+		0, 0, 0, 0, 0},
 	{ str_const_init("json"),    PVT_JSON, pv_get_json,
 		pv_set_json, pv_parse_json_name, pv_parse_json_index, 0, 0},
 	{ str_const_init("json_compact"), PVT_JSON, pv_get_json_compact,
 		pv_set_json, pv_parse_json_name, 0, 0, 0},
 	{ str_const_init("json_pretty"), PVT_JSON, pv_get_json_pretty,
 		pv_set_json, pv_parse_json_name, 0, 0, 0},
+	{ str_const_init("json_compact_noescape"), PVT_JSON, pv_get_json_compact_noescape,
+		pv_set_json, pv_parse_json_name, 0, 0, 0},
 	{ {0, 0}, 0, 0, 0, 0, 0, 0, 0 }
 };
+
+static int pv_get_json_true(struct sip_msg *msg, pv_param_t *param,
+		pv_value_t *res)
+{
+	*res = pv_true;
+	res->flags |= PV_VAL_BOOL;
+	return 0;
+}
+
+static int pv_get_json_false(struct sip_msg *msg, pv_param_t *param,
+		pv_value_t *res)
+{
+	*res = pv_false;
+	res->flags |= PV_VAL_BOOL;
+	return 0;
+}
 
 struct module_exports exports= {
 	"json",        /* module's name */
@@ -369,6 +394,15 @@ int pv_get_json_compact(struct sip_msg* msg,  pv_param_t* pvp, pv_value_t* val)
 	return pv_get_json_ext(msg, pvp, val, JSON_C_TO_STRING_PLAIN);
 }
 
+int pv_get_json_compact_noescape(struct sip_msg* msg,  pv_param_t* pvp, pv_value_t* val)
+{
+	return pv_get_json_ext(msg, pvp, val, JSON_C_TO_STRING_PLAIN
+#if JSON_C_VERSION_NUM >= JSON_C_VERSION_013
+			| JSON_C_TO_STRING_NOSLASHESCAPE
+#endif
+			);
+}
+
 int pv_get_json_pretty(struct sip_msg* msg,  pv_param_t* pvp, pv_value_t* val)
 {
 	return pv_get_json_ext(msg, pvp, val, JSON_C_TO_STRING_PRETTY);
@@ -469,7 +503,14 @@ int pv_get_json_ext(struct sip_msg* msg,  pv_param_t* pvp, pv_value_t* val, int 
 		return pv_get_null(msg, pvp, val);
 	}
 
-	if( json_object_is_type(obj, json_type_int) )
+	if( json_object_is_type(obj, json_type_boolean) )
+	{
+		int_value = json_object_get_boolean(obj);
+		val->rs = int_value ? str_init("true") : str_init("false");
+		val->ri = int_value;
+		val->flags |= PV_VAL_INT|PV_TYPE_INT|PV_VAL_STR|PV_VAL_BOOL;
+	}
+	else if( json_object_is_type(obj, json_type_int) )
 	{
 		int_value = json_object_get_int64(obj);
 		val->rs.s = sint2str(int_value, &val->rs.len);
@@ -674,7 +715,11 @@ int pv_set_json (struct sip_msg* msg,  pv_param_t* pvp, int flag ,
 	}
 	else
 	{
-		if( pvv_is_int(val))
+		if (val->flags & PV_VAL_BOOL)
+		{
+			obj = json_object_new_boolean(val->ri);
+		}
+		else if( pvv_is_int(val))
 		{
 			obj = json_object_new_int(val->ri);
 		}

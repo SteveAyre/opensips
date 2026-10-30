@@ -377,6 +377,7 @@ int dlg_clone_callee_leg(struct dlg_cell *dlg, int cloned_leg_idx)
 		return -1;
 	src_leg = &dlg->legs[cloned_leg_idx];
 	leg = &dlg->legs[dlg->legs_no[DLG_LEGS_USED]];
+	leg->branch_id = src_leg->branch_id;
 
 	if (shm_str_dup(&leg->adv_contact, &src_leg->adv_contact) != 0) {
 		LM_ERR("oom contact\n");
@@ -497,11 +498,6 @@ int dlg_update_leg_info(int leg_idx, struct dlg_cell *dlg, str* tag, str *rr,
 	 * we should not limit the number of dialog legs to the number of tm
 	 * branches, as for a single branch, we can have multiple legs (resulted
 	 * due to parallel forking) downstream.
-	 *
-	if (leg_idx >= MAX_BRANCHES) {
-		LM_WARN("invalid callee leg index (branch id part): %d\n", leg_idx);
-		return -1;
-	}
 	*/
 
 	if (ensure_leg_array(leg_idx + 1, dlg) != 0)
@@ -1904,11 +1900,12 @@ mi_response_t *mi_set_dlg_profile(const mi_params_t *params,
 		&profile_name.s, &profile_name.len) < 0)
 		return init_mi_param_error();
 
-	get_mi_string_param(params, "value",
-		&profile_value.s, &profile_value.len);
+	if (try_get_mi_string_param(params, "value",
+			&profile_value.s, &profile_value.len) == -2)
+		return init_mi_param_error();
 
-	get_mi_int_param(params, "clear_values",
-		&clear_values);
+	if (try_get_mi_int_param(params, "clear_values", &clear_values) == -2)
+		return init_mi_param_error();
 
 	profile = search_dlg_profile(&profile_name);
 	if (!profile) {
@@ -1998,8 +1995,9 @@ mi_response_t *mi_unset_dlg_profile(const mi_params_t *params,
 		&profile_name.s, &profile_name.len) < 0)
 		return init_mi_param_error();
 
-	get_mi_string_param(params, "value",
-		&profile_value.s, &profile_value.len);
+	if (try_get_mi_string_param(params, "value",
+			&profile_value.s, &profile_value.len) == -2)
+		return init_mi_param_error();
 
 	profile = search_dlg_profile(&profile_name);
 	if (!profile) {

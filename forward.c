@@ -143,37 +143,63 @@ error:
  * \note if msg!=null and msg->force_send_socket, the force_send_socket will be used
  */
 const struct socket_info* get_send_socket(struct sip_msg *msg,
-										const union sockaddr_union* to, int proto)
+									const union sockaddr_union* to, int proto)
 {
-	const struct socket_info* send_sock;
+	const struct socket_info* send_sock, *bond_sock;
+	struct socket_info_ref *bond_ref;
 
 	/* check if send interface is not forced */
 	if (msg && msg->force_send_socket){
+		if (msg->force_send_socket->proto == PROTO_BOND) {
+
+			bond_sock = msg->force_send_socket;
+			msg->force_send_socket = NULL;
+			for (bond_ref = bond_sock->bond_sis;
+					bond_ref; bond_ref = bond_ref->next) {
+
+				LM_DBG("checking socket [%.*s]:%d AF %d for "
+					"destination  proto=%d and AF=%d\n",
+					bond_ref->si->sock_str.len, bond_ref->si->sock_str.s,
+					bond_ref->si->proto, bond_ref->si->address.af,
+					proto, to->s.sa_family);
+				if (!bond_ref->si ||
+				(bond_ref->si->proto != proto) ||
+				(bond_ref->si->address.af != to->s.sa_family))
+					continue;
+
+				msg->force_send_socket = bond_ref->si;
+				LM_DBG("bond socket [%.*s] translated into [%.*s] for "
+					"destination  proto=%d and AF=%d\n",
+					bond_sock->name.len, bond_sock->name.s,
+					bond_ref->si->sock_str.len, bond_ref->si->sock_str.s,
+					proto, to->s.sa_family);
+				break;
+			}
+
+			if (!msg->force_send_socket)
+				LM_DBG("no bond member matching proto=%d and AF=%d\n",
+					proto, to->s.sa_family);
+		} else
+		/* no bond forced socket, do extra checks */
 		if (msg->force_send_socket->proto!=proto){
 			LM_DBG("force_send_socket of different proto (%d)!\n", proto);
 			msg->force_send_socket=find_si(&(msg->force_send_socket->address),
 											msg->force_send_socket->port_no,
 											proto);
-		}
-		if (msg->force_send_socket && (msg->force_send_socket->socket!=-1))
+		} else
+		if (msg->force_send_socket->address.af!=to->s.sa_family){
+			LM_DBG("force_send_socket of different AF (sock=%d, dst=%d)!\n",
+				msg->force_send_socket->address.af, to->s.sa_family);
+			msg->force_send_socket=NULL;
+		} else
+		if (msg->force_send_socket)
 			return msg->force_send_socket;
-		else{
-			if (msg->force_send_socket && msg->force_send_socket->socket==-1)
-				LM_WARN("not listening on the requested socket, no fork mode?\n");
-			else
-				LM_WARN("protocol/port mismatch\n");
-		}
+		else
+			LM_WARN("protocol/port/af mismatch\n");
 	};
 
-	if (mhomed && proto==PROTO_UDP){
-		send_sock=get_out_socket(to, proto);
-		if ((send_sock==0) || (send_sock->socket!=-1))
-			return send_sock; /* found or error*/
-		else if (send_sock->socket==-1){
-			LM_WARN("not listening on the requested socket, no fork mode?\n");
-			/* continue: try to use some socket */
-		}
-	}
+	if (mhomed && proto==PROTO_UDP)
+		return get_out_socket(to, proto);
 
 	send_sock=0;
 	/* check if we need to change the socket (different address families -

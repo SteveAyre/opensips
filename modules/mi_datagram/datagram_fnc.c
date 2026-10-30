@@ -41,6 +41,7 @@
 #include "../../resolve.h"
 #include "../../mi/mi_trace.h"
 #include "../../reactor_proc.h"
+#include "../../profiling.h"
 #include "mi_datagram.h"
 #include "datagram_fnc.h"
 
@@ -111,6 +112,17 @@ int  mi_init_datagram_server(sockaddr_dtgram *addr, unsigned int socket_domain,
 	if (socks->rx_sock == -1) {
 		LM_ERR("cannot create RX socket: %s\n", strerror(errno));
 		return -1;
+	}
+
+	/* Turn non-blocking mode on for rx*/
+	flags = fcntl(socks->rx_sock, F_GETFL);
+	if (flags == -1) {
+		LM_ERR("fcntl failed on RX socket: %s\n", strerror(errno));
+		goto err_both;
+	}
+	if (fcntl(socks->rx_sock, F_SETFL, flags | O_NONBLOCK) == -1) {
+		LM_ERR("fcntl: set non-blocking failed for RX socket: %s\n",strerror(errno));
+		goto err_both;
 	}
 
 	switch(socket_domain) {
@@ -192,7 +204,7 @@ err_rx:
 
 int mi_init_datagram_buffer(void){
 
-	mi_buf = pkg_malloc(DATAGRAM_SOCK_BUF_SIZE+1);
+	mi_buf = pkg_malloc(mi_sock_buf_size+1);
 	if ( mi_buf==NULL) {
 		LM_ERR("no more pkg memory\n");
 		return -1;
@@ -265,11 +277,11 @@ static int mi_send_dgram(int fd, char* buf, unsigned int len,
 	if(total_len == 0 || tolen ==0)
 		return -1;
 
-	if (total_len>DATAGRAM_SOCK_BUF_SIZE)
+	if (total_len>mi_sock_buf_size)
 	{
 		LM_DBG("datagram too big, "
-			"truncking, datagram_size is %i\n",DATAGRAM_SOCK_BUF_SIZE);
-		len = DATAGRAM_SOCK_BUF_SIZE;
+			"truncking, datagram_size is %i\n",mi_sock_buf_size);
+		len = mi_sock_buf_size;
 	}
 	/*LM_DBG("destination address length is %i\n", tolen);*/
 	n=sendto(fd, buf, len, 0, to, tolen);
@@ -300,12 +312,12 @@ static void datagram_close_async(mi_response_t *resp,struct mi_handler *hdl,
 	{
 		if (resp!=0) {
 			/*allocate the response datagram*/
-			print_buf.s = pkg_malloc(DATAGRAM_SOCK_BUF_SIZE);
+			print_buf.s = pkg_malloc(mi_sock_buf_size);
 			if(!print_buf.s){
 				LM_ERR("no more pkg memory\n");
 				return;
 			}
-			print_buf.len = DATAGRAM_SOCK_BUF_SIZE;
+			print_buf.len = mi_sock_buf_size;
 
 			ret = print_mi_response(resp, p->id,
 					&print_buf, mi_datagram_pp);
@@ -447,11 +459,10 @@ int mi_datagram_callback(int rx_sock, void *_tx_sock, int was_timeout)
 
 	reply_addr_len = sizeof(reply_addr);
 
-	ret = recvfrom(rx_sock, mi_buf, DATAGRAM_SOCK_BUF_SIZE, 0,
+	ret = recvfrom(rx_sock, mi_buf, mi_sock_buf_size, 0,
 				(struct sockaddr*)&reply_addr, &reply_addr_len);
 
 	if (ret < 0) {
-		LM_ERR("recvfrom %d: (%d) %s\n", ret, errno, strerror(errno));
 		if ((errno == EINTR) ||
 			(errno == EAGAIN) ||
 			(errno == EWOULDBLOCK) ||
@@ -459,7 +470,7 @@ int mi_datagram_callback(int rx_sock, void *_tx_sock, int was_timeout)
 			LM_DBG("got %d (%s), going on\n", errno, strerror(errno));
 			return 0;
 		}
-		LM_DBG("error in recvfrom\n");
+		LM_ERR("recvfrom %d: (%d) %s\n", ret, errno, strerror(errno));
 		return -1;
 	}
 
@@ -469,7 +480,7 @@ int mi_datagram_callback(int rx_sock, void *_tx_sock, int was_timeout)
 	mi_buf[ret] = '\0';
 	LM_DBG("received %d |%.*s|\n", ret, ret, mi_buf);
 
-	if(ret> DATAGRAM_SOCK_BUF_SIZE){
+	if(ret> mi_sock_buf_size){
 		LM_ERR("buffer overflow, dropping\n");
 		return -1;
 	}
@@ -487,6 +498,9 @@ int mi_datagram_callback(int rx_sock, void *_tx_sock, int was_timeout)
 		trace_datagram_err(&PARSE_ERR_STR);
 		return -1;
 	}
+
+	profiling_proc_start( LEVEL_EXTRAPROCS, 0);
+	profiling_proc_enter( LEVEL_EXTRAPROCS, "MI_DATAGRAM handling", 0 );
 
 	req_method = mi_get_req_method(&request);
 	if (req_method)
@@ -512,7 +526,11 @@ int mi_datagram_callback(int rx_sock, void *_tx_sock, int was_timeout)
 		async_hdl = 0;
 	}
 
+	profiling_proc_enter( LEVEL_EXTRAPROCS,
+		ss_merge256("MI_DATAGRAM ",req_method), 0 );
 	response = handle_mi_request(&request, cmd, async_hdl);
+	profiling_proc_exit( LEVEL_EXTRAPROCS, ss_merge256("MI_DATAGRAM ",req_method),
+		(response==NULL)?-1:((response==MI_ASYNC_RPL)?1:0) );
 
 	if (response == NULL) {
 		LM_ERR("failed to build response!\n");
@@ -532,7 +550,7 @@ int mi_datagram_callback(int rx_sock, void *_tx_sock, int was_timeout)
 		trace_datagram_request(cmd, req_method, request.params);
 
 		print_buf.s = mi_buf;
-		print_buf.len = DATAGRAM_SOCK_BUF_SIZE;
+		print_buf.len = mi_sock_buf_size;
 		ret = print_mi_response(response, request.id,
 				&print_buf, mi_datagram_pp);
 
@@ -572,10 +590,11 @@ free_resp:
 				free_async_handler(async_hdl);
 		if (response)
 			free_mi_response(response);
-	} else
-		return 0;
+	}
 free_req:
 	free_mi_request_parsed(&request);
+	profiling_proc_exit( LEVEL_EXTRAPROCS, "MI_DATAGRAM", 0 );
+	profiling_proc_end( LEVEL_EXTRAPROCS, 0);
 	return 0;
 }
 
@@ -599,4 +618,3 @@ void mi_datagram_server(int rx_sock, int tx_sock)
 
 	return;
 }
-

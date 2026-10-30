@@ -259,21 +259,15 @@ static const mi_export_t mi_cmds[] = {
 		{sip_trace_mi_tid,  {"id", 0}},
 		{sip_trace_mi_mode, {"mode", 0}},
 		{sip_trace_mi_2,{"id", "mode", 0}},
-		{EMPTY_MI_RECIPE}
-		}
-	},
-	{ "trace_start", 0, 0, 0, {
+		{EMPTY_MI_RECIPE}}, {0}},
+	{ "start", 0, 0, 0, {
 		{sip_trace_mi_dyn,{"id", "uri", 0}},
 		{sip_trace_mi_dyn,{"id", "uri", "filter", 0}},
 		{sip_trace_mi_dyn,{"id", "uri", "filter", "scope", "type", 0}},
-		{EMPTY_MI_RECIPE}
-		}
-	},
-	{ "trace_stop", 0, 0, 0, {
+		{EMPTY_MI_RECIPE}}, {"trace_start", 0}},
+	{ "stop", 0, 0, 0, {
 		{sip_trace_mi_stop,{"id", 0}},
-		{EMPTY_MI_RECIPE}
-		}
-	},
+		{EMPTY_MI_RECIPE}}, {"trace_stop", 0}},
 	{EMPTY_MI_EXPORT}
 };
 
@@ -899,8 +893,14 @@ static int mod_init(void)
 
 	if (trace_default_syslog_facility < 0)
 		trace_default_syslog_facility = log_facility;
-	if (trace_default_syslog_level != 0)
+	if (trace_default_syslog_level == 0)
 		trace_default_syslog_level = *log_level;
+
+	/* update the levels for all tids, if not explicitely set */
+	for (it = trace_list; it; it = it->next) {
+		if (it->type == TYPE_SYSLOG && it->el.syslog.level == 0)
+			it->el.syslog.level = trace_default_syslog_level;
+	}
 
 	LM_INFO("initializing...\n");
 
@@ -1043,7 +1043,8 @@ static int mod_init(void)
 	if (load_dlg_api(&dlgb) != 0)
 		LM_DBG("failed to load the dialog API (dialog module not loaded?)\n");
 
-	load_tm_api(&tmb);
+	if (load_tm_api(&tmb) != 0)
+		LM_DBG("failed to load the TM API (TM module not loaded?)\n");
 
 	/* statelessly forwarded request callbacks */
 	if (register_slcb(SLCB_REQUEST_OUT, FL_USE_SIPTRACE,
@@ -1151,7 +1152,7 @@ static void trace_info_unref(trace_info_p _ti, unsigned int _cnt)
 	if (should_free) {
 		lock_dealloc(_ti->ref_lock);
 		shm_free(_ti);
-	}	
+	}
 }
 
 
@@ -1456,7 +1457,7 @@ static int trace_b2b_transaction(struct sip_msg* msg, void *trans, void* param)
 	if(tmb.register_tmcb( NULL, t, TMCB_MSG_SENT_OUT,
 	trace_tm_out, info, unref_trace_info) <=0) {
 		LM_ERR("can't register TM SEND OUT callback\n");
-		trace_info_unref(info, 2);
+		trace_info_unref(info, 1);
 		return -1;
 	}
 
@@ -1487,8 +1488,8 @@ static struct b2b_tracer* b2b_set_tracer_cb(void)
 
 static int trace_b2b(struct sip_msg *msg, trace_info_p info)
 {
-	/* mark the initial request with the tracing flag, so the 
-	 * B2B logic, via the "creating new session" callback, will 
+	/* mark the initial request with the tracing flag, so the
+	 * B2B logic, via the "creating new session" callback, will
 	 * install the tracing callback into the B2B logic
 	 */
 	msg->msg_flags |= FL_USE_SIPTRACE_B2B;
@@ -1519,7 +1520,7 @@ static int trace_transaction(struct sip_msg* msg, trace_info_p info, int reverse
 	if(tmb.register_tmcb( msg, 0, TMCB_MSG_SENT_OUT,
 	reverse_dir?trace_tm_out_rev:trace_tm_out, info, free_trace_info_tm) <=0) {
 		LM_ERR("can't register TM SEND OUT callback\n");
-		trace_info_unref(info, 2);
+		trace_info_unref(info, 1);
 		return -1;
 	}
 
@@ -1892,7 +1893,7 @@ static int sip_trace_handle(struct sip_msg *msg, tlist_elem_p el,
 					return -1;
 				}
 				memset(info, 0, sizeof(trace_info_t));
-				info->ref_lock = lock_alloc(); 
+				info->ref_lock = lock_alloc();
 				if (!info->ref_lock) {
 					LM_ERR("could not allocate lock!\n");
 					shm_free(instance);
@@ -1958,7 +1959,7 @@ static int sip_trace_handle(struct sip_msg *msg, tlist_elem_p el,
 			s.s = msg->buf;
 			s.len = msg->len;
 			trace_msg_out( msg, &s, msg->rcv.bind_address, msg->rcv.proto,
-				&tmb.t_gett()->uac[0].request.dst.to, info, TRACE_C_CALLEE);
+				&TM_BRANCH(tmb.t_gett(),0).request.dst.to, info, TRACE_C_CALLEE);
 		} else
 		/* otherwise trace only if per-message or not in local route
 		 * (UAC trans do not have IN msg) */
@@ -2136,7 +2137,7 @@ static int sip_trace(struct sip_msg *msg, trace_info_p info, int leg_flag)
 	}
 
 	set_sock_columns( db_vals[4], db_vals[5], db_vals[6], fromip_buff,
-		&msg->rcv.src_ip, msg->rcv.src_port, msg->rcv.proto);
+		get_rcv_src_ip(&msg->rcv), get_rcv_src_port(&msg->rcv), msg->rcv.proto);
 
 	set_sock_columns( db_vals[7], db_vals[8], db_vals[9], toip_buff,
 		TRACE_GET_DST_IP(msg), TRACE_GET_DST_PORT(msg), msg->rcv.proto);
@@ -2223,7 +2224,7 @@ static int sip_trace_instance(struct sip_msg* msg,
 	}
 
 	set_sock_columns( db_vals[4], db_vals[5], db_vals[6], fromip_buff,
-		&msg->rcv.src_ip, msg->rcv.src_port, msg->rcv.proto);
+		get_rcv_src_ip(&msg->rcv), get_rcv_src_port(&msg->rcv), msg->rcv.proto);
 
 	set_sock_columns( db_vals[7], db_vals[8], db_vals[9], toip_buff,
 		TRACE_GET_DST_IP(msg), TRACE_GET_DST_PORT(msg), msg->rcv.proto);
@@ -2449,9 +2450,11 @@ static void trace_msg_out(struct sip_msg* msg, str  *sbuf,
 {
 	static char fromip_buff[IP_ADDR_MAX_STR_SIZE+12];
 	static char toip_buff[IP_ADDR_MAX_STR_SIZE+12];
-	struct ip_addr to_ip;
+	struct ip_addr to_ip, *ip;
+	struct receive_info ri;
 	trace_instance_p instance;
 	str from_tag;
+	unsigned int port;
 
 	if(parse_from_and_callid(msg, &from_tag) != 0)
 	{
@@ -2513,12 +2516,18 @@ static void trace_msg_out(struct sip_msg* msg, str  *sbuf,
 	{
 		set_columns_to_any(db_vals[7], db_vals[8], db_vals[9]);
 	} else {
+		if (proto != PROTO_UDP && info->conn_id &&
+				tcp_get_rcv(info->conn_id, &ri) == 0) {
+			ip = get_rcv_src_ip(&ri);
+			port = get_rcv_src_port(&ri);
+		} else {
+			ip = &to_ip;
+			port = (unsigned int)(send_sock && send_sock->last_real_ports->remote?
+				send_sock->last_real_ports->remote:su_getport(to));
+		}
 		su2ip_addr(&to_ip, to);
 		set_sock_columns( db_vals[7], db_vals[8], db_vals[9], toip_buff,
-			&to_ip,
-			(unsigned long)(send_sock && send_sock->last_real_ports->remote?
-				send_sock->last_real_ports->remote:su_getport(to)),
-			proto);
+			ip, port, proto);
 	}
 
 	db_vals[10].val.time_val = time(NULL);
@@ -2621,7 +2630,7 @@ static void trace_onreply_in(struct cell* t, int type, struct tmcb_params *ps,
 	db_vals[3].val.str_val.len = len;
 
 	set_sock_columns( db_vals[4], db_vals[5], db_vals[6], fromip_buff,
-		&msg->rcv.src_ip,  msg->rcv.src_port, msg->rcv.proto);
+		get_rcv_src_ip(&msg->rcv), get_rcv_src_port(&msg->rcv), msg->rcv.proto);
 
 	if(trace_local_ip.s && trace_local_ip.len > 0){
 		set_columns_to_trace_local_ip(db_vals[7], db_vals[8], db_vals[9]);
@@ -2690,12 +2699,14 @@ static void trace_onreply_out(struct cell* t, int type, struct tmcb_params *ps,
 	static char toip_buff[IP_ADDR_MAX_STR_SIZE+12];
 	trace_instance_p instance;
 	struct sip_msg* msg;
-	struct ip_addr to_ip;
+	struct ip_addr to_ip, *ip;
+	struct receive_info ri;
 	int len;
 	char statusbuf[8];
 	str *sbuf;
 	struct dest_info *dst;
 	str from_tag;
+	unsigned int port;
 
 	trace_info_t info;
 
@@ -2797,13 +2808,19 @@ static void trace_onreply_out(struct cell* t, int type, struct tmcb_params *ps,
 	{
 		set_columns_to_any( db_vals[7], db_vals[8], db_vals[9]);
 	} else {
+		if (dst->proto != PROTO_UDP && info.conn_id &&
+				tcp_get_rcv(info.conn_id, &ri) == 0) {
+			ip = get_rcv_src_ip(&ri);
+			port = get_rcv_src_port(&ri);
+		} else {
+			ip = &to_ip;
+			port = (unsigned int)(dst->send_sock && dst->send_sock->last_real_ports->remote?
+				dst->send_sock->last_real_ports->remote:su_getport(&dst->to));
+		}
 		memset(&to_ip, 0, sizeof(struct ip_addr));
 		su2ip_addr(&to_ip, &dst->to);
 		set_sock_columns( db_vals[7], db_vals[8], db_vals[9], toip_buff,
-			&to_ip,
-			(unsigned long)(dst->send_sock && dst->send_sock->last_real_ports->remote?
-				dst->send_sock->last_real_ports->remote:su_getport(&dst->to)),
-			dst->proto);
+			ip, port, dst->proto);
 	}
 
 	db_vals[10].val.time_val = time(NULL);
@@ -3234,9 +3251,17 @@ static mi_response_t *sip_trace_mi_dyn(const mi_params_t *params,
 		uri = hep_id->name;
 	}
 	/* default tracing scope is dialog */
-	if (try_get_mi_string_param(params, "scope", &aux.s, &aux.len) < 0 ||
-			((traced_scope = st_parse_flags(&aux)) == 0))
+	if (try_get_mi_string_param(params, "scope", &aux.s, &aux.len) < 0)
 		traced_scope = TRACE_DIALOG;
+	else {
+		traced_scope = st_parse_flags(&aux);
+		if (traced_scope < 0) {
+			LM_ERR("invalid trace scope\n");
+			goto error;
+		}
+		if (traced_scope == 0)
+			traced_scope = TRACE_DIALOG;
+	}
 
 	/* default tracing scope is everything */
 	if (try_get_mi_string_param(params, "type", &aux.s, &aux.len) < 0 ||

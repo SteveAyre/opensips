@@ -27,23 +27,195 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "../../mem/mem.h"
+#include "../../status_report.h"
+#include "reg_events.h"
 #include "reg_records.h"
 
 extern unsigned int default_expires;
 extern const str uac_reg_state[];
+extern void *uac_reg_srg;
 
 static char call_id_ftag_buf[MD5_LEN];
+
+#define UAC_REG_SR_AOR "aor="
+#define UAC_REG_SR_CONTACT ";contact="
+#define UAC_REG_SR_REGISTRAR ";registrar="
+#define UAC_REG_SR_AOR_LEN (sizeof(UAC_REG_SR_AOR) - 1)
+#define UAC_REG_SR_CONTACT_LEN (sizeof(UAC_REG_SR_CONTACT) - 1)
+#define UAC_REG_SR_REGISTRAR_LEN (sizeof(UAC_REG_SR_REGISTRAR) - 1)
 
 int send_unregister(unsigned int hash_index, reg_record_t *rec, str *auth_hdr,
 	unsigned int all_contacts);
 
+enum reg_stat_filter {
+	REG_STAT_ALL,
+	REG_STAT_ENABLED,
+	REG_STAT_REGISTERED,
+	REG_STAT_FAILED
+};
+
+static int count_registrant(void *e_data, void *data, void *r_data)
+{
+	unsigned long *count = (unsigned long *)data;
+
+	(*count)++;
+	return 0;
+}
+
+static int count_enabled_registrant(void *e_data, void *data, void *r_data)
+{
+	reg_record_t *rec = (reg_record_t *)e_data;
+	unsigned long *count = (unsigned long *)data;
+
+	if (rec->flags & REG_ENABLED)
+		(*count)++;
+	return 0;
+}
+
+static int count_registered_registrant(void *e_data, void *data, void *r_data)
+{
+	reg_record_t *rec = (reg_record_t *)e_data;
+	unsigned long *count = (unsigned long *)data;
+
+	if ((rec->flags & REG_ENABLED) && rec->state == REGISTERED_STATE)
+		(*count)++;
+	return 0;
+}
+
+static int count_failed_registrant(void *e_data, void *data, void *r_data)
+{
+	reg_record_t *rec = (reg_record_t *)e_data;
+	unsigned long *count = (unsigned long *)data;
+
+	if ((rec->flags & REG_ENABLED) &&
+		(rec->state == REGISTER_TIMEOUT_STATE ||
+		 rec->state == INTERNAL_ERROR_STATE ||
+		 rec->state == WRONG_CREDENTIALS_STATE ||
+		 rec->state == REGISTRAR_ERROR_STATE))
+		(*count)++;
+	return 0;
+}
+
+static unsigned long get_registrant_count(enum reg_stat_filter filter)
+{
+	slinkedl_run_data_f *count_handler;
+	unsigned long count = 0;
+	unsigned int i;
+	int ret;
+
+	if (!reg_htable)
+		return 0;
+
+	switch (filter) {
+	case REG_STAT_ALL:
+		count_handler = count_registrant;
+		break;
+	case REG_STAT_ENABLED:
+		count_handler = count_enabled_registrant;
+		break;
+	case REG_STAT_REGISTERED:
+		count_handler = count_registered_registrant;
+		break;
+	case REG_STAT_FAILED:
+		count_handler = count_failed_registrant;
+		break;
+	default:
+		LM_ERR("invalid registrant statistic filter %d\n", filter);
+		return 0;
+	}
+
+	for (i = 0; i < reg_hsize; i++) {
+		lock_get(&reg_htable[i].lock);
+		ret = slinkedl_traverse(reg_htable[i].p_list,
+			count_handler, &count, NULL);
+		lock_release(&reg_htable[i].lock);
+
+		if (ret < 0) {
+			LM_ERR("failed to count registrants in bucket %u\n", i);
+			break;
+		}
+	}
+
+	return count;
+}
+
+static unsigned long get_total_registrants(void *unused)
+{
+	return get_registrant_count(REG_STAT_ALL);
+}
+
+static unsigned long get_enabled_registrants(void *unused)
+{
+	return get_registrant_count(REG_STAT_ENABLED);
+}
+
+static unsigned long get_registered_registrants(void *unused)
+{
+	return get_registrant_count(REG_STAT_REGISTERED);
+}
+
+static unsigned long get_failed_registrants(void *unused)
+{
+	return get_registrant_count(REG_STAT_FAILED);
+}
+
+const stat_export_t reg_stats[] = {
+	{"registrants", STAT_IS_FUNC, (stat_var **)get_total_registrants},
+	{"enabled_registrants", STAT_IS_FUNC, (stat_var **)get_enabled_registrants},
+	{"registered_registrants", STAT_IS_FUNC, (stat_var **)get_registered_registrants},
+	{"failed_registrants", STAT_IS_FUNC, (stat_var **)get_failed_registrants},
+	{0, 0, 0}
+};
+
+int reg_build_sr_identifier(const str *aor, const str *contact,
+	const str *registrar, str *ident)
+{
+	int len;
+	char *buf;
+	char *p;
+
+	if (!aor || !contact || !registrar || !aor->s || !contact->s ||
+		!registrar->s) {
+		LM_ERR("missing data for status report identifier\n");
+		return -1;
+	}
+
+	len = UAC_REG_SR_AOR_LEN + aor->len +
+		UAC_REG_SR_CONTACT_LEN + contact->len +
+		UAC_REG_SR_REGISTRAR_LEN + registrar->len;
+	buf = pkg_malloc(len);
+	if (!buf) {
+		LM_ERR("oom\n");
+		return -1;
+	}
+
+	p = buf;
+	memcpy(p, UAC_REG_SR_AOR, UAC_REG_SR_AOR_LEN);
+	p += UAC_REG_SR_AOR_LEN;
+	memcpy(p, aor->s, aor->len);
+	p += aor->len;
+	memcpy(p, UAC_REG_SR_CONTACT, UAC_REG_SR_CONTACT_LEN);
+	p += UAC_REG_SR_CONTACT_LEN;
+	memcpy(p, contact->s, contact->len);
+	p += contact->len;
+	memcpy(p, UAC_REG_SR_REGISTRAR, UAC_REG_SR_REGISTRAR_LEN);
+	p += UAC_REG_SR_REGISTRAR_LEN;
+	memcpy(p, registrar->s, registrar->len);
+
+	ident->s = buf;
+	ident->len = len;
+	return 0;
+}
+
 void reg_print_record(reg_record_t *rec) {
-	LM_DBG("checking uac=[%p] state=[%d][%.*s] expires=[%d]"
+	LM_DBG("checking uac=[%p] state=[%d][%.*s] expires=[%d/%d]"
 			" last_register_sent=[%d] registration_timeout=[%d]"
 			" auth_user[%p][%d]->[%.*s] auth_password=[%p][%d]->[%.*s]"
 			" sock=[%p] clustering=[%.*s/%d] enabled=[%s]\n",
 		rec, rec->state,
-		uac_reg_state[rec->state].len, uac_reg_state[rec->state].s, rec->expires,
+		uac_reg_state[rec->state].len, uac_reg_state[rec->state].s,
+		rec->expires, rec->wanted_expires,
 		(unsigned int)rec->last_register_sent, (unsigned int)rec->registration_timeout,
 		rec->auth_user.s, rec->auth_user.len, rec->auth_user.len, rec->auth_user.s,
 		rec->auth_password.s, rec->auth_password.len,
@@ -131,10 +303,11 @@ int match_reload_record(void *e_data, void *data, void *n_data)
 		!str_strcmp(&coords->registrar, &rec->td.rem_target)) {
 		if (!(new_rec->flags&REG_ENABLED) && rec->flags&REG_ENABLED &&
 			rec->state == REGISTERED_STATE) {
-			if(send_unregister((unsigned long)coords->extra, rec, NULL, 0)==1)
-				rec->state = UNREGISTERING_STATE;
-			else
-				rec->state = INTERNAL_ERROR_STATE;
+			if(send_unregister((unsigned long)coords->extra, rec, NULL, 0)==1) {
+				reg_change_state(rec,UNREGISTERING_STATE);
+			} else {
+				reg_change_state(rec,INTERNAL_ERROR_STATE);
+			}
 		} else if (new_rec->flags&REG_ENABLED && rec->flags&REG_ENABLED &&
 				rec->state == REGISTERED_STATE) {
 			memcpy(new_rec->td.id.call_id.s, rec->td.id.call_id.s,
@@ -144,6 +317,8 @@ int match_reload_record(void *e_data, void *data, void *n_data)
 			new_rec->td.loc_seq.value = rec->td.loc_seq.value;
 			new_rec->last_register_sent = rec->last_register_sent;
 			new_rec->registration_timeout = rec->registration_timeout;
+			/* we are not migrating state here, just inheriting,
+			 * do not call reg_change_state */
 			new_rec->state = rec->state;
 		}
 
@@ -162,6 +337,7 @@ int add_record(uac_reg_map_t *uac, str *now, unsigned int mode,
 	char *p;
 	slinkedl_list_t *list;
 	slinkedl_element_t *new_elem = NULL;
+	int is_new = 1;
 
 	/* Reserve space for record */
 	size = sizeof(reg_record_t) + MD5_LEN +
@@ -189,6 +365,7 @@ int add_record(uac_reg_map_t *uac, str *now, unsigned int mode,
 
 	memset(record, 0, size);
 
+	record->wanted_expires = uac->expires;
 	record->expires = uac->expires;
 
 	td = &(record->td);
@@ -300,12 +477,34 @@ int add_record(uac_reg_map_t *uac, str *now, unsigned int mode,
 	if (mode == REG_DB_LOAD_RECORD) {
 		coords->extra = (void*)(unsigned long)uac->hash_code;
 		if (slinkedl_replace(reg_htable[uac->hash_code].p_list,
-			match_reload_record, coords, new_elem) == 0)
+			match_reload_record, coords, new_elem) == 0) {
 			/* this is a new record altogether */
 			slinkedl_append_element(reg_htable[uac->hash_code].p_list, new_elem);
+		} else {
+			is_new = 0;
+		}
 	}
 
 	reg_print_record(record);
+
+	if (uac_reg_srg && is_new) {
+		str sr_ident = {NULL, 0};
+		if (reg_build_sr_identifier(&record->td.rem_uri, &record->contact_uri,
+			&record->td.rem_target, &sr_ident) == 0) {
+			if (sr_register_identifier(uac_reg_srg, STR2CI(sr_ident),
+					SR_STATUS_NOT_READY,
+					(char *)uac_reg_state[NOT_REGISTERED_STATE].s,
+					uac_reg_state[NOT_REGISTERED_STATE].len, 20) == 0) {
+				sr_add_report_fmt(uac_reg_srg, STR2CI(sr_ident), 0,
+					"created with state %.*s\n",
+					uac_reg_state[NOT_REGISTERED_STATE].len,
+					uac_reg_state[NOT_REGISTERED_STATE].s);
+			} else {
+				LM_ERR("failed to register status report identifier\n");
+			}
+			pkg_free(sr_ident.s);
+		}
+	}
 
 	return 0;
 }
@@ -332,6 +531,7 @@ int init_reg_htable(void) {
 		}
 		reg_htable[i].s_list = NULL;
 	}
+
 	return 0;
 }
 
@@ -350,3 +550,71 @@ void destroy_reg_htable(void) {
 	}
 }
 
+static int reg_state_to_sr_status(int state)
+{
+	switch (state) {
+	case REGISTERED_STATE:
+		return SR_STATUS_READY;
+	case REGISTERING_STATE:
+	case AUTHENTICATING_STATE:
+	case UNREGISTERING_STATE:
+	case AUTHENTICATING_UNREGISTER_STATE:
+		return SR_STATUS_LOADING_DATA;
+	default:
+		return SR_STATUS_NOT_READY;
+	}
+}
+
+void reg_change_state(reg_record_t *rec, int new_state)
+{
+	str sr_ident = {NULL, 0};
+
+	rec->state = new_state;
+	switch (new_state) {
+		case NOT_REGISTERED_STATE:
+			/* NO-OP, just initializing */
+			break;
+		case REGISTERING_STATE:
+			raise_registering_event(rec);	
+			break;
+		case AUTHENTICATING_STATE:
+			raise_authenticating_event(rec);	
+			break;
+		case REGISTERED_STATE:
+			raise_registered_event(rec);	
+			break;
+		case REGISTER_TIMEOUT_STATE:
+			raise_register_timeout_event(rec);	
+			break;
+		case INTERNAL_ERROR_STATE:
+			raise_internal_error_event(rec);	
+			break;
+		case WRONG_CREDENTIALS_STATE:
+			raise_wrong_credentials_event(rec);	
+			break;
+		case REGISTRAR_ERROR_STATE:
+			raise_registrar_error_event(rec);	
+			break;
+		case UNREGISTERING_STATE:
+			raise_unregistering_event(rec);	
+			break;
+		case AUTHENTICATING_UNREGISTER_STATE:
+			raise_authenticating_unregister_event(rec);	
+			break;
+		default:
+			LM_ERR("Unhandled new state %d \n",new_state);
+			break;
+	}
+
+	if (uac_reg_srg && reg_build_sr_identifier(&rec->td.rem_uri,
+		&rec->contact_uri, &rec->td.rem_target, &sr_ident) == 0) {
+		sr_set_status(uac_reg_srg, STR2CI(sr_ident),
+			reg_state_to_sr_status(new_state),
+			(char *)uac_reg_state[new_state].s,
+			uac_reg_state[new_state].len, 0);
+		sr_add_report_fmt(uac_reg_srg, STR2CI(sr_ident), 0,
+			"state changed to %.*s\n",
+			uac_reg_state[new_state].len, uac_reg_state[new_state].s);
+		pkg_free(sr_ident.s);
+	}
+}

@@ -107,6 +107,7 @@
 #include "route.h"
 #include "bin_interface.h"
 #include "globals.h"
+#include "db/pi_framework.h"
 #include "mem/mem.h"
 #include "mem/shm_mem.h"
 #include "mem/rpm_mem.h"
@@ -133,6 +134,7 @@
 #include "statistics.h"
 #include "status_report.h"
 #include "core_stats.h"
+#include "profiling.h"
 #include "pvar.h"
 #include "signals.h"
 #include "shutdown.h"
@@ -148,8 +150,6 @@
 
 #include "test/unit_tests.h"
 #include "lib/dbg/profiling.h"
-
-#include "ssl_tweaks.h"
 
 #include "main_script.h"
 
@@ -219,22 +219,25 @@ static const struct main_script main_script[] = {
 	FN_HNDLR(init_serialization, !=, 0, "serialization"),
 	FN_HNDLR(init_mi_core, <, 0, "MI core"),
 	FN_HNDLR(evi_register_core, !=, 0, "register core events"),
+	FN_HNDLR(init_profiling, !=, 0, "profiling support"),
 	FN_HNDLR(init_black_lists, !=, 0, "black list engine"),
 	FN_HNDLR(resolv_blacklist_init, !=, 0, "resolver's blacklist"),
 	FN_HNDLR(init_dset, !=, 0, "SIP forking logic"),
 	FN_HNDLR(init_db_support, !=, 0, "SQL database support"),
+	FN_HNDLR(pi_framework_init, !=, 0, "PI framework"),
 	FN_HNDLR(init_cdb_support, !=, 0, "CacheDB support"),
+	FN_HNDLR(init_pvar_support, !=, 0, "pseudo-variable support"),
 	FN_HNDLR(init_modules, !=, 0, "modules"),
+	FN_HNDLR(pi_framework_init_db, !=, 0, "PI framework database"),
 	FN_HNDLR(init_auto_scaling, !=, 0, "auto-scaling support"),
 	FN_HNDLR(init_xlog, <, 0, "xlog"),
 	FN_HNDLR(register_route_timers, <, 0, "route_timers"),
-	FN_HNDLR(init_pvar_support, !=, 0, "pseudo-variable support"),
 	FN_HNDLR(init_multi_proc_support, !=, 0, "multi processes support"),
 	FN_HNDLR(init_extra_avps, !=, 0, "avps"),
 	FN_HNDLR(fix_rls, !=, 0, "routing lists"),
 	FN_HNDLR(init_log_level, !=, 0, "logging levels"),
 	FN_HNDLR(init_log_event_cons, <, 0, "log event consumer"),
-	FN_HNDLR(trans_init_udp_listeners, <, 0, "all SIP listeners"),
+	FN_HNDLR(trans_init_all_listeners, <, 0, "all SIP listeners"),
 	FN_HNDLR(init_script_reload, <, 0, "cfg reload ctx"),
 	FN_HNDLR(init_suid, ==, -1, "do_suid"),
 	FN_HNDLR(run_post_fork_handlers, <, 0, "post-fork handlers"),
@@ -407,7 +410,7 @@ int main(int argc, char** argv)
 	/* process pkg mem size from command line */
 	opterr=0;
 
-	options="A:f:cCm:M:b:l:n:N:rRvdDFEVhw:t:u:g:p:P:G:W:o:a:k:s:"
+	options="A:f:cCm:M:b:l:n:N:irRvdDFVhw:t:u:g:p:P:G:W:o:a:k:s:"
 #ifdef UNIT_TESTS
 	"T:"
 #endif
@@ -519,6 +522,9 @@ int main(int argc, char** argv)
 			case 'e':
 					/* ignoring, parsed previously */
 					break;
+			case 'i':
+					in_tree_mode = 1;
+					break;
 			case 'b':
 					maxbuffer=strtol(optarg, &tmp, 10);
 					if (tmp &&(*tmp)){
@@ -562,10 +568,6 @@ int main(int argc, char** argv)
 			case 'F':
 					no_daemon_mode=1;
 					break;
-			case 'E':
-					LM_ERR("-E option deprecated since 3.4, set \"stderror_enabled=yes\" "
-					    "at the script level instead\n");
-					goto error00;
 			case 'N':
 					tcp_workers_no=strtol(optarg, &tmp, 10);
 					if ((tmp==0) ||(*tmp)){

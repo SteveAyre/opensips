@@ -44,6 +44,7 @@ static struct src_sess *src_create_session(struct src_ctx *ctx, str *m_ip, str *
 		return NULL;
 	}
 	memset(ss, 0, sizeof *ss);
+	INIT_LIST_HEAD(&ss->srs);
 	ss->socket = si;
 	ss->ctx = ctx;
 
@@ -91,8 +92,6 @@ static struct src_sess *src_create_session(struct src_ctx *ctx, str *m_ip, str *
 	ss->participants_no = 0;
 	ss->ts = ts;
 
-	INIT_LIST_HEAD(&ss->srs);
-
 #ifdef DBG_SIPREC_HIST
 	ss->hist = sh_push(ss, srec_hist);
 #endif
@@ -100,7 +99,10 @@ static struct src_sess *src_create_session(struct src_ctx *ctx, str *m_ip, str *
 
 	return ss;
 error:
-	src_free_session(ss);
+	/* the session is not linked into the ctx yet, so only discard the
+	 * partially built object here */
+	src_clean_session(ss);
+	shm_free(ss);
 	return NULL;
 }
 
@@ -180,7 +182,7 @@ struct src_sess *src_new_session(str *srs, struct src_ctx *ctx,
 		return NULL;
 
 	if (srs && srs_add_nodes(sess, srs) < 0) {
-		src_free_session(sess);
+		src_free_session_unsafe(sess);
 		return NULL;
 	}
 
@@ -251,26 +253,26 @@ void src_clean_session(struct src_sess *sess)
 	}
 }
 
+/* called with the ctx lock taken, which it releases;
+ * the ctx is freed only when it has no sessions left and the dialog's
+ * DLGCB_DESTROY callback, that holds a pointer to it, has already run */
 void src_release_ctx(struct src_ctx *ctx)
 {
-	SIPREC_LOCK(ctx);
-	if (!list_empty(&ctx->sess)) {
-		LM_DBG("ongoing sessions: %d\n", list_size(&ctx->sess));
+	if (!list_empty(&ctx->sess) || ctx->dlg) {
+		LM_DBG("ctx=%p still in use: sessions=%d dlg=%p\n", ctx,
+				list_size(&ctx->sess), ctx->dlg);
 		SIPREC_UNLOCK(ctx);
 		return;
 	}
 	SIPREC_UNLOCK(ctx);
 
-	if (ctx->dlg)
-		srec_dlg.dlg_ctx_put_ptr(ctx->dlg, srec_dlg_idx, NULL);
 	lock_destroy(&ctx->lock);
 	shm_free(ctx);
 }
 
-/* called without lock */
-void src_free_session(struct src_sess *sess)
+/* called with the ctx lock taken; does not release it */
+void src_free_session_unsafe(struct src_sess *sess)
 {
-	struct src_ctx *ctx = sess->ctx;
 	src_clean_session(sess);
 #ifdef DBG_SIPREC_HIST
 	srec_hlog(sess, SREC_DESTROY, "successful destroying");
@@ -280,6 +282,15 @@ void src_free_session(struct src_sess *sess)
 #endif
 	list_del(&sess->list);
 	shm_free(sess);
+}
+
+/* called without lock */
+void src_free_session(struct src_sess *sess)
+{
+	struct src_ctx *ctx = sess->ctx;
+
+	SIPREC_LOCK(ctx);
+	src_free_session_unsafe(sess);
 	src_release_ctx(ctx);
 }
 
@@ -395,7 +406,7 @@ static int srec_pop_ctx(struct dlg_cell *dlg, bin_packet_t *packet)
 			LM_DBG("group custom extension: <%.*s>\n", group_custom_extension.len, group_custom_extension.s);
 
 		SIPREC_BIN_POP(str, &session_custom_extension);
-		if (group_custom_extension.s)
+		if (session_custom_extension.s)
 			LM_DBG("session custom extension: <%.*s>\n", session_custom_extension.len, session_custom_extension.s);
 
 		SIPREC_BIN_POP(str, &tmp);
@@ -573,6 +584,7 @@ error:
 	if (sess && !update)
 		src_free_session(sess);
 free:
+	SIPREC_LOCK(ctx);
 	src_release_ctx(ctx);
 	return -1;
 }
@@ -756,7 +768,8 @@ void src_event_trigger(enum b2b_entity_type et, str *key,
 		str *logic_key, void *param, enum b2b_event_type event_type,
 		bin_packet_t *store, int backend)
 {
-	struct src_ctx *ctx = (struct src_ctx *)param;
+	struct src_sess *ss = (struct src_sess *)param;
+	struct src_ctx *ctx = ss->ctx;
 
 	switch (event_type) {
 		case B2B_EVENT_CREATE:
@@ -808,6 +821,23 @@ struct src_ctx *src_get_ctx(struct dlg_cell *dlg)
 	return (struct src_ctx *)srec_dlg.dlg_ctx_get_ptr(dlg, srec_dlg_idx);
 }
 
+static void srec_dlg_destroy(struct dlg_cell *dlg, int type, struct dlg_cb_params *_params)
+{
+	struct src_ctx *ctx;
+
+	if (!_params) {
+		LM_ERR("no parameter specified to dlg callback!\n");
+		return;
+	}
+	ctx = *_params->param;
+	/* dialog is going to be removed, so we drop it from the structure */
+	LM_DBG("resetting ctx=%p dlg=%p\n", ctx, ctx->dlg);
+	SIPREC_LOCK(ctx);
+	ctx->dlg = NULL;
+	src_release_ctx(ctx);
+}
+
+
 struct src_ctx *src_new_ctx(struct dlg_cell *dlg)
 {
 	rtp_ctx *rtp;
@@ -838,6 +868,13 @@ struct src_ctx *src_new_ctx(struct dlg_cell *dlg)
 	lock_init(&ctx->lock);
 	ctx->dlg = dlg;
 	ctx->rtp = rtp;
+
+	if (srec_dlg.register_dlgcb(ctx->dlg, DLGCB_DESTROY,
+			srec_dlg_destroy, ctx, NULL)){
+		LM_ERR("cannot register callback for dialog destruction\n");
+		shm_free(ctx);
+		return NULL;
+	}
 
 	srec_dlg.dlg_ctx_put_ptr(dlg, srec_dlg_idx, ctx);
 

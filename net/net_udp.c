@@ -33,10 +33,9 @@
 #include "../timer.h"
 #include "../pt_load.h"
 #include "../cfg_reload.h"
+#include "../profiling.h"
 #include "net_udp.h"
 
-
-#define UDP_SELECT_TIMEOUT  1
 
 /* if the UDP network layer is used or not by some protos */
 static int udp_disabled = 1;
@@ -194,11 +193,19 @@ int udp_init_listener(struct socket_info *si, int status_flags)
 		/* no DF */
 #if defined(IP_MTU_DISCOVER)
 		optval = IP_PMTUDISC_DONT;
-		setsockopt(si->socket, IPPROTO_IP, IP_MTU_DISCOVER, (void*)&optval, sizeof(optval));
+		if (setsockopt(si->socket, IPPROTO_IP, IP_MTU_DISCOVER,
+				(void*)&optval, sizeof(optval)) == -1) {
+			LM_ERR("setsockopt: %s\n", strerror(errno));
+			goto error;
+		}
 #else
 #if defined(IP_DONTFRAG)
 		optval = 1;
-		setsockopt(si->socket, IPPROTO_IP, IP_DONTFRAG, (void*)&optval, sizeof(optval));
+		if (setsockopt(si->socket, IPPROTO_IP, IP_DONTFRAG,
+				(void*)&optval, sizeof(optval)) == -1) {
+			LM_ERR("setsockopt: %s\n", strerror(errno));
+			goto error;
+		}
 #else
 		LM_ERR("DF flag is not supported by your system\n");
 		goto error;
@@ -283,6 +290,7 @@ error:
 	return -1;
 }
 
+
 int udp_bind_listener(struct socket_info *si)
 {
 	union sockaddr_union* addr = &si->su;
@@ -308,26 +316,44 @@ inline static int handle_io(struct fd_map* fm, int idx,int event_type)
 
 	pre_run_handle_script_reload(fm->app_flags);
 
+	profiling_proc_start( LEVEL_SIP, 1);
+
 	switch(fm->type){
 		case F_UDP_READ:
+			profiling_proc_enter( LEVEL_SIP,
+				ss_merge256(
+					protos[((struct socket_info*)fm->data)->proto].name,
+					" proto reading"),
+				1 );
 			n = protos[((struct socket_info*)fm->data)->proto].net.
 				dgram.read( fm->data /*si*/, &read);
+			profiling_proc_exit( LEVEL_SIP, "reading done", n );
 			break;
 		case F_TIMER_JOB:
+			profiling_proc_enter( LEVEL_FULL, "timer_job", 1 );
 			handle_timer_job();
+			profiling_proc_exit( LEVEL_FULL, "timer_job", n);
 			break;
 		case F_SCRIPT_ASYNC:
-			async_script_resume_f( fm->fd, fm->data,
+			profiling_proc_enter( LEVEL_SIP, "async_script", 0 );
+			n = async_script_resume_f( fm->fd, fm->data,
 				(event_type==IO_WATCH_TIMEOUT)?1:0 );
+			profiling_proc_exit( LEVEL_SIP, "async_script", n);
 			break;
 		case F_FD_ASYNC:
-			async_fd_resume( fm->fd, fm->data);
+			profiling_proc_enter( LEVEL_SIP, "async_fd", 0 );
+			n = async_fd_resume( fm->fd, fm->data);
+			profiling_proc_exit( LEVEL_SIP, "async_fd", n);
 			break;
 		case F_LAUNCH_ASYNC:
-			async_launch_resume( fm->fd, fm->data);
+			profiling_proc_enter( LEVEL_SIP, "async_launch", 0 );
+			n = async_launch_resume( fm->fd, fm->data);
+			profiling_proc_exit( LEVEL_SIP, "async_launch", n);
 			break;
 		case F_IPC:
+			profiling_proc_enter( LEVEL_SIP, "ipc_job", 1 );
 			ipc_handle_job(fm->fd);
+			profiling_proc_exit( LEVEL_SIP, "ipc_job", n);
 			break;
 		default:
 			LM_CRIT("unknown fd type %d in UDP worker\n", fm->type);
@@ -341,6 +367,8 @@ inline static int handle_io(struct fd_map* fm, int idx,int event_type)
 		if (reactor_is_empty())
 			dynamic_process_final_exit();
 	}
+
+	profiling_proc_end( LEVEL_SIP, n );
 
 	post_run_handle_script_reload();
 
@@ -412,14 +440,15 @@ static int fork_dynamic_udp_process(void *si_filter)
 		/* we first need to init the reactor to be able to add fd
 		 * into it in child_init routines */
 		if (udp_proc_reactor_init(si) < 0 ||
-		init_child(10000/*FIXME*/) < 0) {
+		init_child(10000/*FIXME*/) < 0 ||
+		self_update_routing_script() < 0) {
 			goto error;
 		}
 		report_conditional_status( 1, 0); /*report success*/
 		/* the child proc is done read&write) dealing with the status pipe */
 		clean_read_pipeend();
 
-		reactor_main_loop(UDP_SELECT_TIMEOUT, error, );
+		reactor_main_loop( worker_reactor_timeout, error, );
 		destroy_worker_reactor();
 error:
 		report_failure_status();
@@ -544,7 +573,7 @@ int udp_start_processes(int *chd_rank, int *startup_done)
 					 * \see receive_msg
 					 * \see main_loop
 					 */
-					reactor_main_loop(UDP_SELECT_TIMEOUT, error, );
+					reactor_main_loop( worker_reactor_timeout, error, );
 					destroy_worker_reactor();
 					exit(-1);
 				} else {
@@ -564,4 +593,3 @@ int udp_start_processes(int *chd_rank, int *startup_done)
 error:
 	return -1;
 }
-

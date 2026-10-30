@@ -60,6 +60,7 @@
 #include "core_stats.h"
 #include "ut.h"
 #include "context.h"
+#include "profiling.h"
 
 
 #ifdef DEBUG_DMALLOC
@@ -112,9 +113,11 @@ int receive_msg(char* buf, unsigned int len, struct receive_info* rcv_info,
 
 	struct sip_msg* msg;
 	struct timeval start;
-	int rc, old_route_type;
+	int rc, ret, old_route_type;
 	char *tmp;
 	str in_buff;
+
+	profiling_proc_enter( LEVEL_SIP, "receive_msg", 0 );
 
 	in_buff.len = len;
 	in_buff.s = buf;
@@ -156,6 +159,11 @@ int receive_msg(char* buf, unsigned int len, struct receive_info* rcv_info,
 		tmp=ip_addr2a(&(rcv_info->src_ip));
 		LM_ERR("Unable to parse msg received from [%s:%d]\n",
 			tmp, rcv_info->src_port);
+		msg->buf=in_buff.s;
+		msg->len=len;
+		msg->rcv=*rcv_info;
+		msg->id=msg_no;
+		msg->msg_flags=msg_flags;
 		/* if a REQUEST msg was detected (first line was successfully parsed)
 		   we should trigger the error route */
 		if ( msg->first_line.type==SIP_REQUEST && sroutes->error.a!=NULL ) {
@@ -212,19 +220,24 @@ int receive_msg(char* buf, unsigned int len, struct receive_info* rcv_info,
 		 * (like presence of at least one via), so you can count
 		 * on via1 being parsed in a pre-script callback --andrei
 		 */
+		profiling_proc_enter( LEVEL_SIP, "request_pre_script", 1 );
 		rc = exec_pre_req_cb(msg);
+		profiling_proc_exit( LEVEL_SIP, "request_pre_script", rc );
 		if (rc == SCB_DROP_MSG) {
 			update_stat( drp_reqs, 1);
 			goto end; /* drop the message */
 		}
 
 		/* exec the routing script */
-		if (rc & SCB_RUN_TOP_ROUTE)
+		if (rc & SCB_RUN_TOP_ROUTE) {
 			/* run the main request route and skip post_script callbacks
 			 * if the TOBE_CONTINUE flag is returned */
-			if ( run_top_route(sroutes->request[DEFAULT_RT], msg) &
-			ACT_FL_TBCONT )
+			profiling_proc_enter( LEVEL_SIP, "request_script", 0 );
+			ret = run_top_route(sroutes->request[DEFAULT_RT], msg);
+			profiling_proc_exit( LEVEL_SIP, "request_script", ret );
+			if ( ret & ACT_FL_TBCONT )
 				goto end;
+		}
 
 		/* execute post request-script callbacks */
 		if (rc & SCB_RUN_POST_CBS)
@@ -275,7 +288,9 @@ int receive_msg(char* buf, unsigned int len, struct receive_info* rcv_info,
 		} else {
 			set_route_type(old_route_type);
 			/* send the msg */
-			forward_reply(msg);
+			profiling_proc_enter( LEVEL_SIP, "reply_forward", 0 );
+			ret = forward_reply(msg);
+			profiling_proc_exit( LEVEL_SIP, "reply_forward", ret );
 			/* TODO - TX reply stat */
 		}
 
@@ -298,6 +313,7 @@ end:
 	pkg_free(msg);
 	if (in_buff.s != buf)
 		pkg_free(in_buff.s);
+	profiling_proc_exit( LEVEL_SIP, "receive_msg", 0 );
 	return 0;
 parse_error_reset:
 	reset_longest_action_list(execmsgthreshold);
@@ -308,6 +324,7 @@ parse_error:
 error:
 	if (in_buff.s != buf)
 		pkg_free(in_buff.s);
+	profiling_proc_exit( LEVEL_SIP, "receive_msg", -1 );
 	return -1;
 }
 

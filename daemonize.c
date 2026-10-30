@@ -49,7 +49,11 @@
 #include <stdlib.h>
 #include <sys/time.h>
 #include <sys/resource.h> /* setrlimit */
+#include <sys/syscall.h>
 #include <unistd.h>
+#if defined(__OS_linux) && !defined(SYS_close_range)
+#include <dirent.h>
+#endif
 #ifdef __OS_linux
 #include <sys/prctl.h>
 #endif
@@ -357,14 +361,7 @@ int daemonize(char* name, int * own_pgid)
 
 	/* close any open file descriptors */
 	closelog();
-
-	/* 32 is the maximum number of inherited open file descriptors */
-	for (r=3; r < 32; r++){
-		/* future children must still inherit
-		 * and write to this pipe end */
-		if (r != status_pipe[1])
-			close(r);
-	}
+	close_open_fds_except(status_pipe[1]);
 
 	if (syslog_enabled)
 		openlog(name, LOG_PID|LOG_CONS, log_facility);
@@ -559,3 +556,65 @@ error:
 	return -1;
 }
 
+
+int get_open_fds_limit(void)
+{
+	struct rlimit rl;
+	int open_max;
+	if (open_files_limit > 0)
+		return open_files_limit;
+	if (getrlimit(RLIMIT_NOFILE, &rl) < 0) {
+		open_max = sysconf(_SC_OPEN_MAX);
+		return (open_max < 0?_POSIX_OPEN_MAX:open_max);
+	}
+	return rl.rlim_cur;
+}
+
+void close_open_fds(void)
+{
+	close_open_fds_except(-1);
+}
+
+void close_open_fds_except(int except)
+{
+#ifdef SYS_close_range
+	if (except < 3) {
+		syscall(SYS_close_range, 3U, ~0U, 0);
+		return;
+	}
+
+	if (except > 3)
+		syscall(SYS_close_range, 3U, (unsigned int)except - 1U, 0);
+	syscall(SYS_close_range, (unsigned int)except + 1U, ~0U, 0);
+#else
+#ifdef __OS_linux
+	DIR *dir;
+	struct dirent *ent;
+	char *end;
+	long dfd;
+	int dir_fd;
+
+	dir = opendir("/proc/self/fd");
+	if (!dir)
+		return;
+
+	dir_fd = dirfd(dir);
+	while ((ent = readdir(dir)) != NULL) {
+		errno = 0;
+		dfd = strtol(ent->d_name, &end, 10);
+		if (errno || end == ent->d_name || *end != '\0' ||
+				dfd < 3 || dfd == except || dfd == dir_fd)
+			continue;
+		syscall(SYS_close, dfd);
+	}
+
+	closedir(dir);
+#else
+	int fd, open_max;
+	open_max = get_open_fds_limit();
+	for (fd = 3; fd < open_max; fd++)
+		if (fd != except)
+			syscall(SYS_close, fd);
+#endif /* __OS_linux */
+#endif /* SYS_close_range */
+}

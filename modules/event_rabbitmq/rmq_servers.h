@@ -40,7 +40,11 @@
 
 #include "../tls_openssl/openssl_api.h"
 #include "../tls_mgm/api.h"
+#ifdef RABBITMQ_MODERN_HDRS
+#include <rabbitmq-c/amqp.h>
+#else
 #include <amqp.h>
+#endif
 #include "../../lib/list.h"
 
 #if AMQP_VERSION < AMQP_VERSION_CODE(0, 10, 0, 0)
@@ -54,8 +58,13 @@ extern gen_lock_t *ssl_lock;
  * as old and inneficient */
 #if defined AMQP_VERSION && AMQP_VERSION >= AMQP_VERSION_CODE(0, 4, 0, 0)
   #define AMQP_VERSION_v04
+#ifdef RABBITMQ_MODERN_HDRS
+#include <rabbitmq-c/tcp_socket.h>
+#include <rabbitmq-c/ssl_socket.h>
+#else
 #include <amqp_tcp_socket.h>
 #include <amqp_ssl_socket.h>
+#endif
 #define rmq_uri struct amqp_connection_info
 #define RMQ_EMPTY amqp_empty_bytes
 #else
@@ -74,7 +83,7 @@ typedef struct _rmq_uri {
 #endif
 
 
-enum rmq_server_state { RMQS_OFF, RMQS_INIT, RMQS_CONN, RMQS_ON };
+enum rmq_server_state { RMQS_OFF, RMQS_INIT, RMQS_CONN, RMQS_ON, RMQS_PREINIT };
 
 #define RMQF_IMM	(1<<0) /* message MUST be delivered to a consumer immediately. */
 #define RMQF_MAND	(1<<1) /* message MUST be routed to a queue */
@@ -103,6 +112,10 @@ int rmq_server_add(modparam_t type, void * val);
 int fixup_rmq_server(void **param);
 struct rmq_server *rmq_get_server(str *cid);
 void rmq_connect_servers(void);
+int rmq_basic_server_publish(rmq_connection_t *conn, int max_frames,
+		str *cid, amqp_bytes_t akey, amqp_bytes_t abody,
+		amqp_basic_properties_t *props, int retries,
+		char *address, int port);
 
 int rmq_send_rm(struct rmq_server *srv, str *rkey, str *body, str *ctype,
 		int *names, int *values);

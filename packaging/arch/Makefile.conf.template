@@ -17,18 +17,18 @@
 #db_postgres= Provides Postgres connectivity for OpenSIPS | PostgreSQL library and development library - tipically libpq5 and libpq-dev
 #db_sqlite= Provides SQLite connectivity for OpenSIPS | SQLite library and development library - tipically libsqlite3 and libsqlite3-dev
 #db_unixodbc= Allows to use the unixodbc package with OpenSIPS | ODBC library and ODBC development library
-#dialplan= Implements generic string translations based on matching and replacement rules | PCRE development library, tipically libpcre-dev
+#dialplan= Implements generic string translations based on matching and replacement rules | PCRE development library, tipically libpcre2-dev
 #emergency= Provides emergency call treatment for OpenSIPS | CURL dev library - tipically libcurl4-openssl-dev
 #event_rabbitmq= Provides the implementation of a RabbitMQ client for the Event Interface | RabbitMQ development library, librabbitmq-dev
 #h350= Enables access to SIP account data stored in an LDAP [RFC4510] directory containing H.350 commObjects | OpenLDAP library & development files, tipically libldap and libldap-dev
-#regex= Offers matching operations against regular expressions using the powerful PCRE library. | Development library for PCRE, tipically libpcre-dev
+#regex= Offers matching operations against regular expressions using the powerful PCRE library. | Development library for PCRE, tipically libpcre2-dev
 #identity= Adds support for SIP Identity (see RFC 4474). | SSL library, tipically libssl
 #jabber= Integrates XODE XML parser for parsing Jabber messages | Expat library.
 #json= Introduces a new type of variable that provides both serialization and de-serialization from JSON format. | JSON library, libjson
 #ldap= Implements an LDAP search interface for OpenSIPS | OpenLDAP library & development files, tipically libldap and libldap-dev
 #lua= Easily implement your own OpenSIPS extensions in Lua | liblua5.1-0-dev, libmemcache-dev and libmysqlclient-dev
 #httpd= Provides an HTTP transport layer implementation for OpenSIPS. | libmicrohttpd
-#mi_xmlrpc_ng= New version of the xmlrpc server that handles xmlrpc requests and generates xmlrpc responses. | parsing/building XML library, tipically libxml
+#mi_xmlrpc= New version of the xmlrpc server that handles xmlrpc requests and generates xmlrpc responses. | parsing/building XML library, tipically libxml
 #mmgeoip= Lightweight wrapper for the MaxMind GeoIP API | libGeoIP
 #osp= Enables OpenSIPS to support secure, multi-lateral peering using the OSP standard | OSP development kit, tipically osptoolkit
 #perl= Easily implement your own OpenSIPS extensions in Perl | Perl library development files, tipically libperl-dev
@@ -59,7 +59,7 @@
 #xml= Introduces a new type of variable that provides both serialization and de-serialization from XML format. | XML library, libxml2-dev
 #xmpp= Gateway between OpenSIPS and a jabber server. It enables the exchange of IMs between SIP clients and XMPP(jabber) clients. | parsing/building XML files, tipically libexpat1-devel
 
-#exclude_modules?= aaa_radius b2b_logic cachedb_cassandra cachedb_couchbase cachedb_memcached cachedb_mongodb cachedb_redis carrierroute cgrates compression cpl_c db_berkeley db_http db_mysql db_oracle db_perlvdb db_postgres db_sqlite db_unixodbc dialplan emergency event_rabbitmq h350 httpd identity jabber json ldap lua mi_xmlrpc_ng mmgeoip osp perl pi_http presence presence_dialoginfo presence_mwi presence_xml proto_sctp proto_tls proto_wss pua pua_bla pua_dialoginfo pua_mi pua_usrloc pua_xmpp python regex rabbitmq rest_client rls siprec sngtc snmpstats tls_mgm xcap xcap_client xml xmpp
+#exclude_modules?= aaa_radius b2b_logic cachedb_cassandra cachedb_couchbase cachedb_memcached cachedb_mongodb cachedb_redis carrierroute cgrates compression cpl_c db_berkeley db_http db_mysql db_oracle db_perlvdb db_postgres db_sqlite db_unixodbc dialplan emergency event_rabbitmq h350 httpd identity jabber json ldap lua mi_xmlrpc mmgeoip osp perl pi_http presence presence_dialoginfo presence_mwi presence_xml proto_sctp proto_tls proto_wss pua pua_bla pua_dialoginfo pua_mi pua_usrloc pua_xmpp python regex rabbitmq rest_client rls siprec sngtc snmpstats tls_mgm xcap xcap_client xml xmpp
 ###
 # Arch Linux specific
 ###

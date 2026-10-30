@@ -31,6 +31,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <string.h>
 
 #define RMQ_SIZE (sizeof(rmq_send_t *))
 #define IS_ERR(_err) (errno == _err)
@@ -145,32 +146,39 @@ void rmq_free_param(rmq_params_t *rmqp)
 			rmqp->conn.uri.user != rmq_static_holder.s)
 		shm_free(rmqp->conn.uri.user);
 	if ((rmqp->conn.flags & RMQ_PARAM_PASS) && rmqp->conn.uri.password &&
+			rmqp->conn.uri.password != rmqp->conn.uri.user &&
 			rmqp->conn.uri.password != rmq_static_holder.s)
 		shm_free(rmqp->conn.uri.password);
 	if ((rmqp->conn.flags & RMQF_MAND) && rmqp->routing_key.s)
 		shm_free(rmqp->routing_key.s);
 }
 
-void rmq_destroy_connection(rmq_connection_t *conn)
+void rmq_destroy_connection(rmq_connection_t *conn, int temporarely, int force)
 {
 	switch (conn->state)
 	{
 	case RMQS_ON:
 	case RMQS_CONN:
-		rmq_error("closing channel",
-				amqp_channel_close(conn->conn, RMQ_DEFAULT_CHANNEL, AMQP_REPLY_SUCCESS));
+		if (!force)
+			rmq_error("closing channel",
+					amqp_channel_close(conn->conn, RMQ_DEFAULT_CHANNEL, AMQP_REPLY_SUCCESS));
 	case RMQS_INIT:
-		rmq_error("closing connection",
-				amqp_connection_close(conn->conn, AMQP_REPLY_SUCCESS));
+		if (!force)
+			rmq_error("closing connection",
+					amqp_connection_close(conn->conn, AMQP_REPLY_SUCCESS));
 		if (amqp_destroy_connection(conn->conn) < 0)
 			LM_ERR("cannot destroy connection\n");
 	case RMQS_OFF:
+	case RMQS_PREINIT:
 		break;
 	default:
 		LM_WARN("Unknown rmq server state %d\n", conn->state);
 	}
 
-	conn->state = RMQS_OFF;
+	if (temporarely)
+		conn->state = RMQS_PREINIT;
+	else
+		conn->state = RMQS_OFF;
 
 	if (conn->tls_dom) {
 		tls_api.release_domain(conn->tls_dom);
@@ -187,7 +195,7 @@ void rmq_destroy(evi_reply_sock *sock)
 	if ((sock->flags & EVI_PARAMS) && sock->params) {
 		rmq_free_param((rmq_params_t *)sock->params);
 		rmq_params_t *rmqp = (rmq_params_t *)sock->params;
-		rmq_destroy_connection(&rmqp->conn);
+		rmq_destroy_connection(&rmqp->conn, 0, 0);
 	}
 	shm_free(sock);
 }
@@ -197,28 +205,38 @@ static int rmq_sendmsg(rmq_send_t *rmqs)
 {
 	rmq_params_t * rmqp = (rmq_params_t *)rmqs->sock->params;
 	int ret;
-	int re_publish = 0;
+	int re_publish = 2;
 	amqp_basic_properties_t props;
+
+	memset(&props, 0, sizeof props);
 
 	if (!rmqp || !(rmqp->conn.flags & RMQF_MAND)) {
 		LM_ERR("not enough socket info\n");
 		return -1;;
 	}
 
-	if (rmqp->conn.state == RMQS_OFF)
+	/* FIXME:
+	 * We need a new state for un-initialised connections
+	 * Unlike server connections, this ones are not initialised at startup
+	 */
+	if (rmqp->conn.state == RMQS_OFF) {
+		LM_INFO("server disconnected\n");
 		return 0;
+	}
 
 	rmqp->conn.uri.host = rmqs->sock->address.s;
 
 	rmqp->conn.uri.port = rmqs->sock->port;
 
-	ret = rmq_basic_publish(&rmqp->conn,
+	ret = rmq_basic_server_publish(&rmqp->conn,
 			RMQ_DEFAULT_FRAMES,
 			&rmqs->sock->address,
 			amqp_cstring_bytes(rmqp->routing_key.s),
 			amqp_cstring_bytes(rmqs->msg),
 			((rmqp->conn.flags & RMQF_NOPER)?&props:0),
-			re_publish);
+			re_publish,
+			rmqs->sock->address.s,
+			rmqs->sock->port);
 
 	return ret;
 }

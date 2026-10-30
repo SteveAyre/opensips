@@ -8,6 +8,10 @@
 #   exclude_modules, skip_modules, include_modules
 #   extra_defs
 #
+# Source directories containing loadable modules.  New module collections only
+# need to be added here; discovery, clean and statistics rules consume this.
+MODULE_DIRS ?= modules modules-contrib
+
 # History:
 # --------
 #              created by andrei
@@ -64,8 +68,8 @@ TOP_SRCDIR?=    $(shell realpath `dirname $(_makefile_defs_path)`)
 MAIN_NAME=opensips
 
 #version number
-VERSION_MAJOR = 3
-VERSION_MINOR = 7
+VERSION_MAJOR = 4
+VERSION_MINOR = 1
 VERSION_SUBMINOR = 0
 VERSION_BUILD = dev
 
@@ -230,7 +234,7 @@ arm_macros= __arm__ __thumb__
 arm6_macros= __ARM_ARCH_6__
 arm7_macros= __ARM_ARCH_7__ __ARM_ARCH_7A__
 
-arm64_macros= __AARCH64EL__
+arm64_macros= __aarch64__ __AARCH64EL__ __AARCH64EB__
 
 ppc_macros= __powerpc __powerpc__ __POWERPC__ __ppc__ _ARCH_PPC
 ppc64_macros= __ppc64__ _ARCH_PPC64
@@ -531,51 +535,13 @@ endif
 
 ifneq (,$(MEM_STATS_HDR))
 EXPECTED_MD5=$(shell [ -f $(MEM_STATS_HDR) ] && tail -n 1 $(MEM_STATS_HDR) | awk '{print $$4}')
-MODULES_MD5=$(shell find $(dir $(MEM_STATS_HDR))/../modules -maxdepth 2 -name "[Mm]akefile" | \
+MODULES_MD5=$(shell find $(addprefix $(dir $(MEM_STATS_HDR))/../,$(MODULE_DIRS)) \
+			-maxdepth 2 \
+			-name "[Mm]akefile" | \
 			awk -F/ '{print $$(NF - 1)}' | sort -u | $(md5sum_cmd) | awk '{print $$1}')
 ifneq ($(EXPECTED_MD5),$(MODULES_MD5))
 REGENERATE_MEM_STATS=remove-mem-stats
 endif
-endif
-
-ifeq ($(DBXML2HTML),)
-DBXML2HTML = $(shell which xsltproc)
-endif
-
-ifneq ($(DBXML2HTML),)
-ifeq ($(DBHTMLCSS),)
-DBHTMLCSS = ../../../doc/module-docbook.css
-endif
-#DBHTMLXSL = /usr/share/xml/docbook/stylesheet/nwalsh/html/docbook.xsl
-# On CentOS, this is the right path:
-#DBHTMLXSL = /usr/share/sgml/docbook/xsl-stylesheets/xhtml/docbook.xsl
-
-DBHTMLXSL=$(shell \
-	if   [ -e /usr/share/xml/docbook/xsl-stylesheets-1.79.2-nons/xhtml/docbook.xsl ]; then \
-		echo "/usr/share/xml/docbook/xsl-stylesheets-1.79.2-nons/xhtml/docbook.xsl"; \
-	elif [ -e /usr/share/xml/docbook/stylesheet/nwalsh/html/docbook.xsl ]; then \
-		echo "/usr/share/xml/docbook/stylesheet/nwalsh/html/docbook.xsl"; \
-	elif [ -e /usr/share/sgml/docbook/xsl-stylesheets/xhtml/docbook.xsl ]; then \
-		echo "/usr/share/sgml/docbook/xsl-stylesheets/xhtml/docbook.xsl"; \
-	elif [ -e /usr/share/xml/docbook/xsl-stylesheets*/xhtml/docbook.xsl ]; then \
-		ls -1 /usr/share/xml/docbook/xsl-stylesheets*/xhtml/docbook.xsl; \
-	fi)
-DBXML2HTMLPARAMS = --stringparam section.autolabel 1
-DBXML2HTMLPARAMS += --stringparam section.label.includes.component.label 1
-DBXML2HTMLPARAMS += --stringparam generate.toc "book toc,title,figure,table,example"
-DBXML2HTMLPARAMS += --stringparam html.stylesheet $(DBHTMLCSS)
-endif
-
-ifeq ($(DBHTML2TXT),)
-DBHTML2TXT = $(shell which lynx)
-endif
-
-ifneq ($(DBHTML2TXT),)
-DBHTML2TXTPARAMS = -force_html -dump -nolist -width=72
-endif
-
-ifeq ($(DBXML2PDF),)
-DBXML2PDF = $(shell which docbook2pdf)
 endif
 
 MKTAGS=ctags -R .
@@ -749,6 +715,10 @@ ifeq ($(ARCH), arm6)
 endif
 
 ifeq ($(ARCH), arm7)
+	use_fast_lock=yes
+endif
+
+ifeq ($(ARCH), aarch64)
 	use_fast_lock=yes
 endif
 
@@ -1667,25 +1637,8 @@ $(warning	No locking method found so far, trying SYS V sems)
 		found_lock_method=yes
 endif
 
-# override pthread functions for libssl >= 1.1
 TWEAK_DEFS=
 TWEAK_LIBS=
-ifeq ($(CROSS_COMPILE),)
-SSL_BUILDER=$(shell \
-	if pkg-config --exists libssl; then \
-		echo 'pkg-config libssl'; \
-	fi)
-endif
-
-ifneq ($(SSL_BUILDER),)
-	VER = $(shell $(SSL_BUILDER) --modversion | \
-	      awk -F. '{print $$1 * 100 + $$2}')
-# test if we have a version higher or equal than 1.1
-ifeq ($(shell test $(VER) -ge 101; echo $$?),0)
-	TWEAK_DEFS = -pthread
-	TWEAK_LIBS = -pthread -rdynamic -ldl -Wl,-Bsymbolic-functions
-endif
-endif
 
 
 ## Unit Testing - required extensions

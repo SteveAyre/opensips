@@ -31,6 +31,7 @@
 #include <stdlib.h>
 
 #include "../../lock_ops.h"
+#include "../../statistics.h"
 #include "../../ut.h"
 #include "../../mem/shm_mem.h"
 #include "../tm/dlg.h"
@@ -84,6 +85,7 @@ typedef struct reg_record {
 	str auth_user;
 	str auth_password;
 	unsigned int state;
+	unsigned int wanted_expires;
 	unsigned int expires;
 	time_t last_register_sent;
 	time_t registration_timeout;
@@ -111,6 +113,7 @@ typedef struct record_coords {
 
 extern reg_table_t reg_htable;
 extern unsigned int reg_hsize;
+extern const stat_export_t reg_stats[];
 
 void *reg_alloc(size_t size);
 void reg_free(void *ptr);
@@ -121,5 +124,10 @@ void new_call_id_ftag_4_record(reg_record_t *rec, str *now);
 int add_record(uac_reg_map_t *uac, str *now, unsigned int mode,
 	record_coords_t *coords);
 void reg_print_record(reg_record_t *rec);
+
+int reg_build_sr_identifier(const str *aor, const str *contact,
+	const str *registrar, str *ident);
+
+void reg_change_state(reg_record_t *rec, int new_state);
 
 #endif

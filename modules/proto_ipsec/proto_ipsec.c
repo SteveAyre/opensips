@@ -49,6 +49,7 @@
 #define IPSEC_CTX_TM_PUT(t, ctx) tm_ipsec.t_ctx_put_ptr(t, ipsec_ctx_tm_idx, ctx)
 
 
+extern int is_tcp_main;
 static int ipsec_default_client_port = 0;
 static int ipsec_default_server_port = 0;
 static str ipsec_allowed_algorithms;
@@ -64,7 +65,7 @@ static int proto_ipsec_init_listener(struct socket_info *si);
 static int proto_ipsec_bind_listener(struct socket_info *si);
 static int proto_ipsec_send(const struct socket_info* source,
 		char* buf, unsigned int len, const union sockaddr_union* to,
-		unsigned int id);
+		unsigned int id, struct sip_msg *msg);
 static int ipsec_pre_script_handler( struct sip_msg *msg, void *param);
 static void ipsec_usrloc_handler(void *binding, ul_cb_type type, ul_cb_extra *_);
 
@@ -311,7 +312,7 @@ static int proto_ipsec_add_listeners(void)
 		si = socket_info2id(&it->socket_info);
 		si->proto = PROTO_UDP;
 		si->flags |= SI_INTERNAL;
-		udp = new_sock_info(si);
+		udp = new_sock_info(si, NULL);
 		if (!udp) {
 			LM_ERR("could not add UDP listening sucket for %s:%d\n",
 					si->name, si->port);
@@ -321,7 +322,7 @@ static int proto_ipsec_add_listeners(void)
 		si->proto = PROTO_TCP;
 		si->workers = 0;
 		si->flags |= SI_REUSEPORT;
-		tcp = new_sock_info(si);
+		tcp = new_sock_info(si, NULL);
 		if (!tcp) {
 			LM_ERR("could not add TCP listening sucket for %s:%d\n",
 					si->name, si->port);
@@ -366,7 +367,6 @@ static int proto_ipsec_init(struct proto_info *pi)
 
 static int proto_ipsec_init_listener(struct socket_info *si)
 {
-	return 0;
 	int ret;
 	/* force reuse port for all connections */
 	si->flags |= SI_REUSEPORT;
@@ -383,13 +383,20 @@ static int proto_ipsec_init_listener(struct socket_info *si)
 
 static int proto_ipsec_bind_listener(struct socket_info *si)
 {
-	/* we only need to bind the UDP listener */
-	return udp_bind_listener(si);
+	int socket = si->socket; /* backup socket */
+	if (udp_bind_listener(si) < 0)
+		return -1;
+	if (is_tcp_main) {
+		if (tcp_bind_listener(si) < 0)
+			return -1;
+		si->socket = socket;
+	}
+	return 0;
 }
 
 static int proto_ipsec_send(const struct socket_info* source,
 		char* buf, unsigned int len, const union sockaddr_union* to,
-		unsigned int id)
+		unsigned int id, struct sip_msg *msg)
 {
 	struct ip_addr ip;
 	unsigned short port;
@@ -446,7 +453,7 @@ static int proto_ipsec_send(const struct socket_info* source,
 			(fl.type == SIP_REQUEST?"request":"reply"), proto2a(source->proto),
 			source->address_str.len, source->address_str.s, source->port_no,
 			ip_addr2a(&ip), port);
-	ret = protos[source->proto].tran.send(source, buf, len, to, id);
+	ret = protos[source->proto].tran.send(source, buf, len, to, id, msg);
 	if (ret >= 0)
 		return ret;
 	/* TODO: handle protocol fallback! - need to update via? */
@@ -464,7 +471,7 @@ static int proto_ipsec_send(const struct socket_info* source,
 			(fl.type == SIP_REQUEST?"request":"reply"), proto2a(source->proto),
 			source->address_str.len, source->address_str.s, source->port_no,
 			ip_addr2a(&ip), port);
-	return protos[source->proto].tran.send(source, buf, len, to, id);
+	return protos[source->proto].tran.send(source, buf, len, to, id, msg);
 }
 
 static int ipsec_aka_auth_match_f(const struct authenticate_body *auth,
@@ -497,7 +504,7 @@ static int ipsec_aka_auth_remove_param(struct sip_msg *msg, struct hdr_field *hd
 		}
 
 	if (!del_lump(msg, p - msg->buf, c - p, HDR_WWW_AUTHENTICATE_T)) {
-		LM_ERR("could not delelete parameter [%.*s]\n", (int)(c - p), p);
+		LM_ERR("could not delete parameter [%.*s]\n", (int)(c - p), p);
 		return -1;
 	}
 	return 0;
@@ -771,7 +778,7 @@ static int w_ipsec_create(struct sip_msg *msg, int *_port_ps, int *_port_pc,
 
 	sa = ipsec_get_security_client(req, algos);
 	if (!sa) {
-		LM_ERR("could not find a matching Secrity-Client header\n");
+		LM_ERR("could not find a matching Security-Client header\n");
 		ret = -2;
 		goto release_user;
 	}
@@ -1132,7 +1139,7 @@ a P-CSCF for one IMPI at any one time.
 		return SCB_RUN_ALL;
 	}
 	memcpy(is_protected, integrity_protected.s, integrity_protected.len);
-	if (is_protected) {
+	if (is_secure) {
 		memcpy(is_protected + integrity_protected.len, "yes", 3);
 		integrity_protected.len += 3;
 	} else {

@@ -67,6 +67,7 @@ int rl_timer_interval = RL_TIMER_INTERVAL;
 int rl_limit_per_interval = 0;
 
 int rl_repl_cluster = 0;
+int rl_br_replication;
 struct clusterer_binds clusterer_api;
 
 int rl_window_size=10;   /* how many seconds the window shall hold*/
@@ -76,7 +77,9 @@ static str db_url = {0,0};
 str db_prefix = str_init("rl_pipe_");
 
 unsigned int rl_repl_timer_expire = RL_TIMER_INTERVAL;
+unsigned int rl_br_repl_timer_expire = RL_BR_CLEANUP_TOUT;
 static unsigned int rl_repl_timer_interval = RL_TIMER_BCAST;
+static unsigned int rl_br_repl_timer_interval = RL_BR_TIMER_BCAST;
 
 /* === */
 
@@ -95,6 +98,9 @@ static unsigned int rl_repl_timer_interval = RL_TIMER_BCAST;
 	lock_release(l); \
 	LM_INFO("%d: - release\n", __LINE__); \
 } while (0)
+#endif
+#ifndef MAX
+#define MAX(a,b) ( ((a)>(b))?(a):(b))
 #endif
 
 /* module functions */
@@ -117,7 +123,7 @@ mi_response_t *mi_get_pid(const mi_params_t *params,
 								struct mi_handler *async_hdl);
 mi_response_t *mi_dump_pipe(const mi_params_t *params,
 								struct mi_handler *async_hdl);
-								
+
 static int pv_get_rl_count(struct sip_msg *msg, pv_param_t *param,
 		pv_value_t *res);
 static int pv_parse_rl_count(pv_spec_p sp, const str *in);
@@ -156,6 +162,9 @@ static const param_export_t params[] = {
 	{ "repl_buffer_threshold",	INT_PARAM,	&rl_buffer_th			},
 	{ "repl_timer_interval",	INT_PARAM,	&rl_repl_timer_interval		},
 	{ "repl_timer_expire",		INT_PARAM,	&rl_repl_timer_expire		},
+	{ "bridge_replication",     INT_PARAM,	&rl_br_replication		},
+	{ "bridge_repl_timer_interval",INT_PARAM,	&rl_br_repl_timer_interval		},
+	{ "bridge_repl_timer_expire",	INT_PARAM,	&rl_br_repl_timer_expire		},
 	{ "pipe_replication_cluster",	INT_PARAM,	&rl_repl_cluster		},
 	{ "window_size",            INT_PARAM,  &rl_window_size},
 	{ "slot_period",            INT_PARAM,  &rl_slot_period},
@@ -173,28 +182,28 @@ static const param_export_t params[] = {
 #define RLH6 "Params: pipe ; Dumps the details of a (SBT) pipe. "
 
 static const mi_export_t mi_cmds [] = {
-	{"rl_list", RLH1, 0, 0, {
+	{"list", RLH1, 0, 0, {
 		{mi_stats, {0}},
 		{mi_stats_1, {"pipe", 0}},
 		{mi_stats_2, {"filter", 0}},
 		{mi_stats_3, {"filter_out", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"rl_list", 0}
 	},
-	{"rl_reset_pipe", RLH2, 0, 0, {
+	{"reset_pipe", RLH2, 0, 0, {
 		{mi_reset_pipe, {"pipe", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"rl_reset_pipe", 0}
 	},
-	{"rl_set_pid", RLH3, 0, 0, {
+	{"set_pid", RLH3, 0, 0, {
 		{mi_set_pid, {"ki", "kp", "kd", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"rl_set_pid", 0}
 	},
-	{"rl_get_pid", RLH4, 0, 0, {
+	{"get_pid", RLH4, 0, 0, {
 		{mi_get_pid, {0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"rl_get_pid", 0}
 	},
-	{"rl_dump_pipe", RLH6, 0, 0, {
+	{"dump_pipe", RLH6, 0, 0, {
 		{mi_dump_pipe, {"pipe", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"rl_dump_pipe", 0}
 	},
 	{EMPTY_MI_EXPORT}
 };
@@ -294,6 +303,10 @@ int get_cpuload(void)
 					(n_sirq	- o_sirq)	+
 					(n_stl	- o_stl);
 		long long d_idle =	(n_idle - o_idle);
+		if (d_total <= 0) {
+			LM_ERR("invalid CPU time delta %lld\n", d_total);
+			return -1;
+		}
 
 		*rl_load_value = 1.0 - ((double)d_idle) / (double)d_total;
 	}
@@ -423,16 +436,12 @@ static int mod_init(void)
 		return -1;
 	}
 
+	_rl_repl_timer_expire = rl_repl_timer_expire;
+
 	/* register timer to reset counters */
 	if (register_utimer("rl-timer", rl_timer, NULL,
 	rl_timer_interval*1000*1000U, TIMER_FLAG_DELAY_ON_DELAY) < 0 ) {
 		LM_ERR("could not register timer function\n");
-		return -1;
-	}
-	if(rl_repl_cluster)
-	if (register_utimer("rl-utimer", rl_timer_repl, NULL,
-			rl_repl_timer_interval * 1000, TIMER_FLAG_DELAY_ON_DELAY) < 0) {
-		LM_ERR("failed to register utimer\n");
 		return -1;
 	}
 
@@ -458,6 +467,26 @@ static int mod_init(void)
 		LM_ERR("cannot allocate the table\n");
 		return -1;
 	}
+
+	if (rl_repl_cluster && register_utimer("rl-broadcast", rl_broadcast, NULL,
+			rl_repl_timer_interval * 1000, TIMER_FLAG_DELAY_ON_DELAY) < 0) {
+		LM_ERR("failed to register replication timer\n");
+		return -1;
+	}
+
+	if (rl_br_replication && rl_repl_cluster && clusterer_api.has_bridge(rl_repl_cluster)) {
+		/* grace seconds should be larger, as pipes arriving
+		    over bridge links will typically have higher timeouts */
+		_rl_repl_timer_expire = MAX(rl_repl_timer_expire, rl_br_repl_timer_expire);
+
+		if (register_utimer("rl-agg-broadcast", rl_broadcast_wan, NULL,
+			    rl_br_repl_timer_interval * 1000, TIMER_FLAG_DELAY_ON_DELAY) < 0) {
+
+			LM_ERR("failed to register agg-replication timer\n");
+			return -1;
+		}
+	}
+
 
 	if (rl_repl_init() < 0) {
 		LM_ERR("cannot init bin replication\n");
@@ -888,23 +917,23 @@ error:
 mi_response_t *mi_dump_pipe(const mi_params_t *params,
 								struct mi_handler *async_hdl)
 {
-	mi_response_t *resp;  	//mi response 
+	mi_response_t *resp;  	//mi response
 	mi_item_t *resp_obj;	//mi response part[s]?
-	mi_item_t *window_item, *bucket_item, *machine_item; 
+	mi_item_t *window_item, *bucket_item, *machine_item;
 							//objects for buckets + replication vars.
-	mi_item_t *bucket_arr, *nodes_arr; 
+	mi_item_t *bucket_arr, *nodes_arr;
 							//objects to hold the mi resp arrays.
 	str pipe_name; 			//var for mi arg
-	
-	unsigned int hash_idx;  //var to hold hash index 
+
+	unsigned int hash_idx;  //var to hold hash index
 	rl_pipe_t **pipe;		//pipe object we're looking at.
 	int pipe_total = 0; 	//hold total of all buckets + nodes.
-	
+
 	str *alg; 				//var to hold alg name
-	
+
 	rl_repl_counter_t *nodes;
 							//replication node pointer
-	rl_repl_counter_t *d;	//nodes iterator 
+	rl_repl_counter_t *d;	//nodes iterator
 	/***** Bucket Vars ***/
 	#define U2MILI(__usec__) (__usec__/1000)
 	#define S2MILI(__sec__)  (__sec__ *1000)
@@ -916,10 +945,10 @@ mi_response_t *mi_dump_pipe(const mi_params_t *params,
 
 	struct timeval tv;
 	/**** End Bucket Vars ***/
-	//Get pipe name into variable 
+	//Get pipe name into variable
 	if (get_mi_string_param(params, "pipe", &pipe_name.s, &pipe_name.len) < 0)
 		return init_mi_param_error();
-	
+
 	hash_idx = core_hash(&(pipe_name), NULL, rl_htable.size);
 	//hash_idx = RL_GET_INDEX(pipe_name);
 	lock_set_get(rl_htable.locks, ((hash_idx) % rl_htable.locks_no));
@@ -932,18 +961,18 @@ mi_response_t *mi_dump_pipe(const mi_params_t *params,
 		//RL_RELEASE_LOCK(hash_idx);
 		return init_mi_error(404, MI_SSTR("Pipe not found"));
 	}
-	
-	
+
+
 	//Start building response:
-	resp = init_mi_result_object(&resp_obj); //create response object 
+	resp = init_mi_result_object(&resp_obj); //create response object
 	if (!resp)
 		goto error;
 	//Start building response:
-	
-	//We know how to handle SBT 
+
+	//We know how to handle SBT
 	if ((*pipe)->algo == PIPE_ALGO_HISTORY) {
 		window_item = add_mi_object(resp_obj, MI_SSTR("Window"));
-		if(!window_item) 
+		if(!window_item)
 			goto error;
 		/******** This is where the bucket dump should be ****/
 		gettimeofday(&tv, NULL);
@@ -967,20 +996,20 @@ mi_response_t *mi_dump_pipe(const mi_params_t *params,
 				if(add_mi_string(window_item, MI_SSTR("Status"), MI_SSTR("Expired")) < 0)
 					goto error;
 			} else if (now_total - start_total >= rl_win_ms) {
-				first_good_index = ((((now_total - rl_win_ms) - start_total)/rl_slot_period + 1) 
+				first_good_index = ((((now_total - rl_win_ms) - start_total)/rl_slot_period + 1)
 					+ (*pipe)->rwin.start_index) % (*pipe)->rwin.window_size;
 
 				for (i=first_good_index; i != (*pipe)->rwin.start_index; i=(i+1)%(*pipe)->rwin.window_size)
 				{
 					bucket_item = add_mi_object(bucket_arr, 0, 0);
-					if(!bucket_item) 
+					if(!bucket_item)
 						goto error;
 					if(add_mi_number(bucket_item, MI_SSTR("Index"), i) < 0)
 						goto error;
 					if(add_mi_number(bucket_item, MI_SSTR("Count"), (*pipe)->rwin.window[i]) < 0)
 						goto error;
 					pipe_total += (*pipe)->rwin.window[i];
-					
+
 				}
 				if(add_mi_string(window_item, MI_SSTR("Status"), MI_SSTR("OK")) < 0)
 					goto error;
@@ -1006,28 +1035,28 @@ mi_response_t *mi_dump_pipe(const mi_params_t *params,
 			if(add_mi_number(window_item, MI_SSTR("Bucket Total"), pipe_total) < 0)
 				goto error;
 		}
-		
+
 	} else {
 		//For non-SBT pipes, we just add the counter.
 		pipe_total += (*pipe)->counter;
 	}
 	/************* End Bucket Loop ***************/
-	
+
 	if (add_mi_string(resp_obj, MI_SSTR("Pipe"), pipe_name.s, pipe_name.len) < 0)
 		goto error;
-	
+
 	if (!(alg = get_rl_algo_name_local((*pipe)->algo))) {
 		LM_ERR("[BUG] unknown algorithm %d\n", (*pipe)->algo);
 		if(add_mi_string(resp, MI_SSTR("Algorithm"), MI_SSTR("UNKNOWN")) < 0)
 			goto error;
-	
-	} 
-	else if (add_mi_string(resp_obj, MI_SSTR("Algorithm"), alg->s, alg->len) < 0) 
-		goto error;	
-	
+
+	}
+	else if (add_mi_string(resp_obj, MI_SSTR("Algorithm"), alg->s, alg->len) < 0)
+		goto error;
+
 	if (add_mi_number(resp_obj, MI_SSTR("Counter"), (*pipe)->counter) < 0)
 		goto error;
-	
+
 	nodes_arr = add_mi_array(resp_obj, MI_SSTR("Replication Nodes"));
 	if(!nodes_arr)
 		goto error;
@@ -1040,8 +1069,8 @@ mi_response_t *mi_dump_pipe(const mi_params_t *params,
 		if(!machine_item)
 			goto error;
 		pipe_total += d->counter;
-		
-		if(add_mi_number(machine_item,MI_SSTR("MachineID"), d->machine_id) < 0)
+
+		if(add_mi_number(machine_item,MI_SSTR("MachineID"), d->id.machine) < 0)
 			goto error;
 		if(add_mi_number(machine_item,MI_SSTR("NodeCounter"), d->counter) < 0)
 			goto error;
@@ -1050,9 +1079,9 @@ mi_response_t *mi_dump_pipe(const mi_params_t *params,
 	if(add_mi_number(resp_obj, MI_SSTR("Total"), pipe_total) < 0)
 		goto error;
 	//RL_RELEASE_LOCK(hash_idx);
-	
+
 	return resp;
-	
+
 
 error:
 	if(hash_idx) lock_set_release(rl_htable.locks, ((hash_idx) % rl_htable.locks_no));
@@ -1061,8 +1090,8 @@ error:
 
 	#undef U2MILI
 	#undef S2MILI
-}									
-								
+}
+
 mi_response_t *mi_reset_pipe(const mi_params_t *params,
 								struct mi_handler *async_hdl)
 {

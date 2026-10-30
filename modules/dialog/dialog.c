@@ -77,6 +77,8 @@ int dlg_del_delay = 0;               /* in seconds, default off */
 str dlg_extra_hdrs = {NULL,0};
 int race_condition_timeout = 5; /* seconds until call termination is triggered,
 					after 200OK -> CANCEL race detection */
+int auto_prack_hangup_on_failure = 0;
+int auto_prack_fr_timeout = 3;
 
 /* statistic variables */
 int dlg_enable_stats = 1;
@@ -118,7 +120,7 @@ static int pv_get_dlg_count( struct sip_msg *msg, pv_param_t *param,
 		pv_value_t *res);
 
 /* commands wrappers and fixups */
-static int w_create_dialog(struct sip_msg*, str *flags_str);
+static int w_create_dialog(struct sip_msg*, void *flags_param);
 static int w_match_dialog(struct sip_msg *msg, void *seq_match_mode_val);
 static int api_match_dialog(struct sip_msg *msg, int _seq_match_mode);
 static int w_validate_dialog(struct sip_msg*);
@@ -134,6 +136,7 @@ static int fixup_check_avp(void** param);
 static int fixup_check_var(void** param);
 static int fixup_lmode(void **param);
 static int fixup_leg(void **param);
+static int fixup_create_dlg_flags(void **param);
 static int w_set_dlg_flag(struct sip_msg *msg, void *mask);
 static int w_reset_dlg_flag(struct sip_msg *msg, void *mask);
 static int w_is_dlg_flag_set(struct sip_msg *msg, void *mask);
@@ -149,7 +152,7 @@ static int w_get_dlg_vals(struct sip_msg *msg, pv_spec_t *v_name,
 		pv_spec_t *v_val, str *callid);
 static int w_tsl_dlg_flag(struct sip_msg *msg, void *_idx, int *_val);
 static int w_set_dlg_shtag(struct sip_msg *msg, str *shtag);
-static int load_dlg_ctx(struct sip_msg *msg, str *callid, void* lmode);
+static int load_dlg_ctx(struct sip_msg *msg, str *callid, void* lmode, int *active);
 static int unload_dlg_ctx(struct sip_msg *msg);
 
 static int fixup_route(void** param);
@@ -183,10 +186,18 @@ int pv_get_dlg_json(struct sip_msg *msg, pv_param_t *param,
 		pv_value_t *res);
 int pv_get_dlg_ctx_json(struct sip_msg *msg, pv_param_t *param,
 		pv_value_t *res);
+int pv_get_dlg_options_ping_interval(struct sip_msg *msg, pv_param_t *param,
+		pv_value_t *res);
+int pv_set_dlg_options_ping_interval(struct sip_msg *msg, pv_param_t *param, int op,
+		pv_value_t *val);
+int pv_get_dlg_reinvite_ping_interval(struct sip_msg *msg, pv_param_t *param,
+		pv_value_t *res);
+int pv_set_dlg_reinvite_ping_interval(struct sip_msg *msg, pv_param_t *param, int op,
+		pv_value_t *val);
 
 static const cmd_export_t cmds[]={
 	{"create_dialog", (cmd_function)w_create_dialog, {
-		{CMD_PARAM_STR|CMD_PARAM_OPT,0,0}, {0,0,0}},
+		{CMD_PARAM_STR|CMD_PARAM_OPT,fixup_create_dlg_flags,0}, {0,0,0}},
 		REQUEST_ROUTE},
 	{"set_dlg_profile", (cmd_function)w_set_dlg_profile, {
 		{CMD_PARAM_STR,0,0},
@@ -263,7 +274,8 @@ static const cmd_export_t cmds[]={
 		REQUEST_ROUTE},
 	{"load_dialog_ctx",(cmd_function)load_dlg_ctx, {
 		{CMD_PARAM_STR,0,0},
-		{CMD_PARAM_STR|CMD_PARAM_OPT,fixup_lmode,0}, {0,0,0}},
+		{CMD_PARAM_STR|CMD_PARAM_OPT,fixup_lmode,0},
+		{CMD_PARAM_INT|CMD_PARAM_OPT,0,0}, {0,0,0}},
 		ALL_ROUTES},
 	{"unload_dialog_ctx",(cmd_function)unload_dlg_ctx,
 		{{0,0,0}}, ALL_ROUTES},
@@ -302,6 +314,8 @@ static const param_export_t mod_params[]={
 	{ "delete_delay",          INT_PARAM, &dlg_del_delay            },
 	{ "dlg_extra_hdrs",        STR_PARAM, &dlg_extra_hdrs.s         },
 	{ "dlg_match_mode",        INT_PARAM, &seq_match_mode           },
+	{ "auto_prack_hangup_on_failure", INT_PARAM, &auto_prack_hangup_on_failure },
+	{ "auto_prack_fr_timeout", INT_PARAM, &auto_prack_fr_timeout },
 	{ "db_url",                STR_PARAM, &db_url.s                 },
 	{ "db_mode",               INT_PARAM, &dlg_db_mode              },
 	{ "table_name",            STR_PARAM, &dialog_table_name        },
@@ -368,67 +382,66 @@ static const stat_export_t mod_stats[] = {
 
 
 static const mi_export_t mi_cmds[] = {
-	{ "dlg_list", 0, MI_NAMED_PARAMS_ONLY, 0, {
+	{ "list", 0, MI_NAMED_PARAMS_ONLY, 0, {
 		{mi_print_dlgs, {0}},
 		{mi_print_dlgs_1, {"callid", 0}},
 		{mi_print_dlgs_2, {"callid", "from_tag", 0}},
 		{mi_print_dlgs_cnt, {"index", "counter", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"dlg_list", 0}
 	},
-	{ "dlg_list_ctx", 0, MI_NAMED_PARAMS_ONLY, 0, {
+	{ "list_ctx", 0, MI_NAMED_PARAMS_ONLY, 0, {
 		{mi_print_dlgs_ctx, {0}},
 		{mi_print_dlgs_1_ctx, {"callid", 0}},
 		{mi_print_dlgs_2_ctx, {"callid", "from_tag", 0}},
 		{mi_print_dlgs_cnt_ctx, {"index", "counter", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"dlg_list_ctx", 0}
 	},
-	{ "dlg_end_dlg", 0, 0, 0, {
+	{ "end_dlg", 0, 0, 0, {
 		{mi_terminate_dlg_1, {"dialog_id", 0}},
 		{mi_terminate_dlg_2, {"dialog_id", "extra_hdrs", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"dlg_end_dlg", 0}
 	},
-	{ "dlg_db_sync", 0, 0, 0, {
+	{ "db_sync", 0, 0, 0, {
 		{mi_sync_db_dlg, {0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"dlg_db_sync", 0}
 	},
-	{ "dlg_restore_db", 0, 0, 0, {
+	{ "restore_db", 0, 0, 0, {
 		{mi_restore_dlg_db, {0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"dlg_restore_db", 0}
 	},
-	{ "dlg_cluster_sync", 0, 0, 0, {
+	{ "cluster_sync", 0, 0, 0, {
 		{mi_sync_cl_dlg, {0}},
 		{mi_sync_cl_dlg, {"sharing_tag", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"dlg_cluster_sync", 0}
 	},
 	{ "profile_get_size", 0, 0, 0, {
 		{mi_get_profile_1, {"profile", 0}},
 		{mi_get_profile_2, {"profile", "value", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {0}
 	},
 	{ "profile_list_dlgs", 0, 0, 0, {
 		{mi_profile_list_1, {"profile", 0}},
 		{mi_profile_list_2, {"profile", "value", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {0}
 	},
 	{ "profile_get_values", 0, 0, 0, {
 		{mi_get_profile_values, {"profile", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {0}
 	},
 	{ "list_all_profiles", 0, 0, 0, {
 		{mi_list_all_profiles, {0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {0}
 	},
 	{ "profile_end_dlgs", 0, 0, 0, {
 		{mi_profile_terminate_1, {"profile", 0}},
 		{mi_profile_terminate_2, {"profile", "value", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {0}
 	},
-	{ "dlg_push_var", 0, 0, 0, {
+	{ "push_var", 0, 0, 0, {
 		{mi_push_dlg_var, {"dlg_val_name", "dlg_val_value", "DID", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"dlg_push_var", 0}
 	},
-	{ "dlg_send_sequential",
-		"send sequential request within dialog",
+	{ "send_sequential",		"send sequential request within dialog",
 		MI_ASYNC_RPL_FLAG|MI_NAMED_PARAMS_ONLY, 0, {
 		{mi_send_sequential_dlg, {"callid", 0}},
 		{mi_send_sequential_dlg, {"callid", "mode", 0}},
@@ -439,18 +452,18 @@ static const mi_export_t mi_cmds[] = {
 		{mi_send_sequential_dlg, {"callid", "method", "body", 0}},
 		{mi_send_sequential_dlg, {"callid", "method", "body", "mode", 0}},
 		{mi_send_sequential_dlg, {"callid", "method", "body", "mode", "headers", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"dlg_send_sequential", 0}
 	},
-	{ "dlg_set_profile", 0, 0, 0, {
+	{ "set_profile", 0, 0, 0, {
 		{mi_set_dlg_profile, {"dlg_id", "profile", 0}},
 		{mi_set_dlg_profile, {"dlg_id", "profile","value", 0}},
 		{mi_set_dlg_profile, {"dlg_id", "profile","value", "clear_values", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"dlg_set_profile", 0}
 	},
-	{ "dlg_unset_profile", 0, 0, 0, {
+	{ "unset_profile", 0, 0, 0, {
 		{mi_unset_dlg_profile, {"dlg_id", "profile", 0}},
 		{mi_unset_dlg_profile, {"dlg_id", "profile","value", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"dlg_unset_profile", 0}
 	},
 	{EMPTY_MI_EXPORT}
 };
@@ -480,6 +493,10 @@ static const pv_export_t mod_items[] = {
 		pv_get_dlg_ctx_json, 0,  0, 0, 0, 0 },
 	{ str_const_init("DLG_del_delay"),       1000,
 		pv_get_dlg_deldelay, pv_set_dlg_deldelay,  0, 0, 0, 0 },
+	{ str_const_init("DLG_options_ping_interval"),    1000,
+		pv_get_dlg_options_ping_interval, pv_set_dlg_options_ping_interval,  0, 0, 0, 0 },
+	{ str_const_init("DLG_reinvite_ping_interval"),   1000,
+		pv_get_dlg_reinvite_ping_interval, pv_set_dlg_reinvite_ping_interval,  0, 0, 0, 0 },
 	{ {0, 0}, 0, 0, 0, 0, 0, 0, 0 }
 };
 
@@ -596,6 +613,18 @@ static int free_fixup_route(void** param)
 {
 	if (*param)
 		unref_script_route( (struct script_route_ref *)*param );
+	return 0;
+}
+
+static int fixup_create_dlg_flags(void **param)
+{
+	str *flags_str = (str *)*param;
+	int flags;
+
+	flags = parse_create_dlg_flags(flags_str);
+	if (flags < 0)
+		return -1;
+	*param = (void *)(unsigned long)flags;
 	return 0;
 }
 
@@ -807,6 +836,8 @@ static int mod_init(void)
 	/* allocate a slot in the processing context */
 	ctx_dlg_idx = context_register_ptr(CONTEXT_GLOBAL, ctx_dlg_idx_destroy);
 	ctx_timeout_idx = context_register_int(CONTEXT_GLOBAL, NULL);
+	ctx_options_ping_interval_idx = context_register_int(CONTEXT_GLOBAL, NULL);
+	ctx_reinvite_ping_interval_idx = context_register_int(CONTEXT_GLOBAL, NULL);
 	ctx_lastdstleg_idx = context_register_int(CONTEXT_GLOBAL, NULL);
 
 	/* create dialog state changed event */
@@ -880,7 +911,7 @@ static int mod_init(void)
 	}
 
 	/* init handlers */
-	init_dlg_handlers(default_timeout);
+	init_dlg_handlers(default_timeout, options_ping_interval, reinvite_ping_interval);
 
 	/* init timer */
 	if (init_dlg_timer(dlg_ontimeout)!=0) {
@@ -950,7 +981,7 @@ static int mod_init(void)
 	}
 
 	destroy_cachedb(0);
-	
+
 	return 0;
 }
 
@@ -1008,12 +1039,12 @@ static void mod_destroy(void)
 }
 
 
-static int w_create_dialog(struct sip_msg *req, str *flags_str)
+static int w_create_dialog(struct sip_msg *req, void *flags_param)
 {
 	struct cell *t;
-	int flags;
+	unsigned int flags;
 
-	flags = flags_str? parse_create_dlg_flags(flags_str): 0;
+	flags = flags_param ? (unsigned int)(unsigned long)flags_param : 0;
 
 	/* don't allow both Re-INVITE and OPTIONS pinging */
 	if ((flags & (DLG_FLAG_PING_CALLER|DLG_FLAG_REINVITE_PING_CALLER)) ==
@@ -1173,7 +1204,7 @@ static int w_set_dlg_profile(struct sip_msg *msg, str *prof_name, str *value, in
 	if (profile->has_value) {
 		if (!value) {
 			LM_WARN("missing value\n");
-			return -1;	
+			return -1;
 		}
 
 		if (clear_values && *clear_values) {
@@ -1695,15 +1726,305 @@ int pv_get_dlg_deldelay(struct sip_msg *msg, pv_param_t *param,
 	return 0;
 }
 
+int pv_get_dlg_options_ping_interval(struct sip_msg *msg, pv_param_t *param,
+		pv_value_t *res)
+{
+	int l;
+	char *ch = NULL;
+	struct dlg_cell *dlg;
+
+	if(res==NULL)
+		return -1;
+
+	if ( (dlg=get_current_dialog())!=NULL ) {
+		dlg_lock_dlg(dlg);
+		if (dlg_has_options_pinging(dlg)) {
+			if (dlg->state == DLG_STATE_DELETED)
+				l = 0;
+			else if (dlg->state < DLG_STATE_CONFIRMED_NA)
+				l = dlg->options_ping_interval;
+			else
+				if (dlg->pl) {
+					l = dlg->pl->timeout - get_ticks();
+				} else {
+					LM_ERR("BUG: NULL option ping timer for dlg=[%p]\n", dlg);
+					l = -1;
+				}
+		} else {
+			l = -1;
+		}
+		dlg_unlock_dlg(dlg);
+
+		/* The ping was not set and we return NULL. */
+		if (l == -1)
+			return pv_get_null( msg, param, res);
+
+	} else if (current_processing_ctx) {
+		if ((l=ctx_options_ping_interval_get())==0)
+			return pv_get_null( msg, param, res);
+	} else {
+		return pv_get_null( msg, param, res);
+	}
+
+	res->ri = l;
+
+	ch = int2str( (unsigned long)res->ri, &l);
+	res->rs.s = ch;
+	res->rs.len = l;
+
+	res->flags = PV_VAL_STR|PV_VAL_INT|PV_TYPE_INT;
+
+	return 0;
+}
+
+int pv_get_dlg_reinvite_ping_interval(struct sip_msg *msg, pv_param_t *param,
+		pv_value_t *res)
+{
+	int l;
+	char *ch = NULL;
+	struct dlg_cell *dlg;
+
+	if(res==NULL)
+		return -1;
+
+	if ( (dlg=get_current_dialog())!=NULL ) {
+		dlg_lock_dlg(dlg);
+		if (dlg_has_reinvite_pinging(dlg)) {
+			if (dlg->state == DLG_STATE_DELETED)
+				l = 0;
+			else if (dlg->state < DLG_STATE_CONFIRMED_NA)
+				l = dlg->reinvite_ping_interval;
+			else
+				if (dlg->reinvite_pl) {
+					l = dlg->reinvite_pl->timeout - get_ticks();
+				} else {
+					LM_ERR("BUG: NULL reINVITE ping timer for dlg=[%p]\n", dlg);
+					l = -1;
+				}
+		} else {
+			l = -1;
+		}
+		dlg_unlock_dlg(dlg);
+
+		/* The ping was not set and we return NULL. */
+		if (l == -1)
+			return pv_get_null( msg, param, res);
+
+	} else if (current_processing_ctx) {
+		if ((l=ctx_reinvite_ping_interval_get())==0)
+			return pv_get_null( msg, param, res);
+	} else {
+		return pv_get_null( msg, param, res);
+	}
+
+	res->ri = l;
+
+	ch = int2str( (unsigned long)res->ri, &l);
+	res->rs.s = ch;
+	res->rs.len = l;
+
+	res->flags = PV_VAL_STR|PV_VAL_INT|PV_TYPE_INT;
+
+	return 0;
+}
+
+
+int pv_set_dlg_options_ping_interval(struct sip_msg *msg, pv_param_t *param, int op,
+		pv_value_t *val)
+{
+	struct dlg_cell *dlg;
+	int ping_interval, timer_update = 0;
+
+	if (val==NULL || val->flags & PV_VAL_NULL) {
+		LM_ERR("cannot assign dialog ping_interval to NULL\n");
+		return -1;
+	}
+
+	if (!(val->flags&PV_VAL_INT)){
+		/* try parsing the string */
+		if (str2sint(&val->rs, &ping_interval) < 0) {
+			LM_ERR("assigning non-int value to dialog ping interval\n");
+			return -1;
+		}
+	} else {
+		ping_interval = val->ri;
+	}
+
+	if (ping_interval <= 0) {
+		LM_ERR("cannot set a non-positive ping interval\n");
+		return -1;
+	}
+
+	if ((dlg = get_current_dialog()) != NULL) {
+		if (!(dlg->flags & DLG_FLAG_END_ON_RACE_CONDITION) ||
+		!(dlg->flags & DLG_FLAG_WAS_CANCELLED)) {
+			if (!dlg_has_options_pinging(dlg)) {
+				LM_ERR("cannot assign dialog ping_interval to dialog without ping\n");
+				return -1;
+			}
+			dlg_lock_dlg(dlg);
+			LM_DBG("Set options ping interval to [%d]\n", ping_interval);
+			dlg->options_ping_interval = ping_interval;
+			if (dlg->state < DLG_STATE_CONFIRMED || dlg_db_mode != DB_MODE_REALTIME)
+				dlg->flags |= DLG_FLAG_CHANGED;
+
+			if (route_type != LOCAL_ROUTE && (dlg->state == DLG_STATE_CONFIRMED_NA ||
+			dlg->state == DLG_STATE_CONFIRMED))
+				timer_update = 1;
+
+			dlg_unlock_dlg(dlg);
+
+			if (timer_update) {
+				/* FIXME:
+					Do not run update_dlg_ping_timer while setting the PV
+					from local_route when sending out an OPTIONS.
+					It will cause a deadlock: re-entrant lock for
+					ping_timer->lock.
+				*/
+				update_dlg_ping_timer(dlg->pl, ping_interval, 0);
+			}
+
+			if (dialog_repl_cluster)
+				replicate_dialog_updated(dlg);
+		} else {
+			LM_DBG("Set ping interval for race condition dlg [%.*s] - ignoring\n",
+			dlg->callid.len,dlg->callid.s);
+		}
+
+	} else if (current_processing_ctx) {
+		/* store it until we match the dialog */
+		ctx_options_ping_interval_set( ping_interval );
+	} else {
+		LM_CRIT("BUG - no processing context found while setting ping interval!\n");
+		return -1;
+	}
+
+	return 0;
+}
+
+int pv_set_dlg_reinvite_ping_interval(struct sip_msg *msg, pv_param_t *param, int op,
+		pv_value_t *val)
+{
+	struct dlg_cell *dlg;
+	int ping_interval, timer_update = 0;
+
+	if (val==NULL || val->flags & PV_VAL_NULL) {
+		LM_ERR("cannot assign dialog ping_interval to NULL\n");
+		return -1;
+	}
+
+	if (!(val->flags&PV_VAL_INT)){
+		/* try parsing the string */
+		if (str2sint(&val->rs, &ping_interval) < 0) {
+			LM_ERR("assigning non-int value to dialog ping interval\n");
+			return -1;
+		}
+	} else {
+		ping_interval = val->ri;
+	}
+
+	if (ping_interval <= 0) {
+		LM_ERR("cannot set a non-positive ping interval\n");
+		return -1;
+	}
+
+	if ((dlg = get_current_dialog()) != NULL) {
+		if (!(dlg->flags & DLG_FLAG_END_ON_RACE_CONDITION) ||
+		!(dlg->flags & DLG_FLAG_WAS_CANCELLED)) {
+			if (!dlg_has_reinvite_pinging(dlg)) {
+				LM_ERR("cannot assign dialog ping_interval to dialog without ping\n");
+				return -1;
+			}
+			dlg_lock_dlg(dlg);
+			LM_DBG("Set reinvite ping interval to [%d]\n", ping_interval);
+			dlg->reinvite_ping_interval = ping_interval;
+			if (dlg->state < DLG_STATE_CONFIRMED || dlg_db_mode != DB_MODE_REALTIME)
+				dlg->flags |= DLG_FLAG_CHANGED;
+
+			if (route_type != LOCAL_ROUTE && (dlg->state == DLG_STATE_CONFIRMED_NA ||
+			dlg->state == DLG_STATE_CONFIRMED))
+				timer_update = 1;
+
+			dlg_unlock_dlg(dlg);
+
+			if (timer_update) {
+				/* FIXME:
+					Do not run update_dlg_ping_timer while setting the PV
+					from local_route when sending out a reINVITE.
+					It will cause a deadlock: re-entrant lock for
+					reinvite_ping_timer->lock.
+				*/
+				update_dlg_ping_timer(dlg->reinvite_pl, ping_interval, 1);
+			}
+
+			if (dialog_repl_cluster)
+				replicate_dialog_updated(dlg);
+		} else {
+			LM_DBG("Set ping interval for race condition dlg [%.*s] - ignoring\n",
+			dlg->callid.len,dlg->callid.s);
+		}
+
+	} else if (current_processing_ctx) {
+		/* store it until we match the dialog */
+		ctx_reinvite_ping_interval_set( ping_interval );
+	} else {
+		LM_CRIT("BUG - no processing context found while setting ping interval!\n");
+		return -1;
+	}
+
+	return 0;
+}
+
 int pv_get_dlg_dir(struct sip_msg *msg, pv_param_t *param,
 		pv_value_t *res)
 {
 	int dir;
+	struct dlg_cell *dlg;
+	str ftag;
+	int i;
 
 	if(res==NULL)
 		return -1;
 
 	dir = get_dlg_direction();
+
+	/* If direction unknown and we have a reply, determine from From-tag */
+	if (dir == DLG_DIR_NONE && msg != NULL &&
+	    msg->first_line.type == SIP_REPLY) {
+		dlg = get_current_dialog();
+		if (dlg != NULL && dlg->legs != NULL &&
+		    dlg->legs_no[DLG_LEGS_USED] > 0) {
+			if (parse_from_header(msg) >= 0 && get_from(msg)) {
+				ftag = get_from(msg)->tag_value;
+
+				if (ftag.s == NULL || ftag.len <= 0)
+					goto done;
+
+				if (dlg->legs[DLG_CALLER_LEG].tag.s != NULL &&
+				    dlg->legs[DLG_CALLER_LEG].tag.len == ftag.len &&
+				    strncmp(dlg->legs[DLG_CALLER_LEG].tag.s,
+				            ftag.s, ftag.len) == 0) {
+					/* From-tag is caller's → reply heading to caller */
+					dir = DLG_DIR_UPSTREAM;
+				} else {
+					for (i = DLG_FIRST_CALLEE_LEG;
+					     i < dlg->legs_no[DLG_LEGS_USED]; i++) {
+						if (dlg->legs[i].tag.s != NULL &&
+						    dlg->legs[i].tag.len == ftag.len &&
+						    strncmp(dlg->legs[i].tag.s,
+						            ftag.s, ftag.len) == 0) {
+							/* From-tag is callee's → reply heading to callee */
+							dir = DLG_DIR_DOWNSTREAM;
+							break;
+						}
+					}
+				}
+			}
+		}
+	}
+
+done:
+
 	switch (dir) {
 		case DLG_DIR_NONE:
 			return pv_get_null( msg, param, res);
@@ -1911,7 +2232,7 @@ int pv_set_dlg_deldelay(struct sip_msg *msg, pv_param_t *param,
 			return NULL; 			\
 		}					\
 	} while(0)					\
-		
+
 static char *dlg_get_json_out(struct dlg_cell *dlg,int ctx,int *out_len)
 {
 	static char dlg_info[DLG_CTX_JSON_BUFF_SIZE];
@@ -1925,7 +2246,7 @@ static char *dlg_get_json_out(struct dlg_cell *dlg,int ctx,int *out_len)
 
 	/* I know, this sucks.
 
-	Until we find a better way to push MI 
+	Until we find a better way to push MI
 	output straight to the script level,
 	this will have to do :( */
 
@@ -1946,10 +2267,10 @@ static char *dlg_get_json_out(struct dlg_cell *dlg,int ctx,int *out_len)
 		dlg->to_uri.len,dlg->to_uri.s);
 
 	if (i<0) {
-		LM_ERR("Failed to print dlg json \n");		
+		LM_ERR("Failed to print dlg json \n");
 		return NULL;
 	}
-	
+
 	DEC_AND_CHECK_LEN(len, i + 1);
 	p+=i;
 
@@ -1962,9 +2283,9 @@ static char *dlg_get_json_out(struct dlg_cell *dlg,int ctx,int *out_len)
 		dlg->legs[DLG_CALLER_LEG].route_set.len,dlg->legs[DLG_CALLER_LEG].route_set.s,
 		dlg->legs[DLG_CALLER_LEG].bind_addr->sock_str.len,dlg->legs[DLG_CALLER_LEG].bind_addr->sock_str.s,
 		dlg->legs[DLG_CALLER_LEG].out_sdp.len,dlg->legs[DLG_CALLER_LEG].out_sdp.s);
-		
+
 		if (i<0) {
-			LM_ERR("Failed to print dlg json \n");		
+			LM_ERR("Failed to print dlg json \n");
 			return NULL;
 		}
 
@@ -1981,7 +2302,7 @@ static char *dlg_get_json_out(struct dlg_cell *dlg,int ctx,int *out_len)
 			*p++=',';
 			DEC_AND_CHECK_LEN(len,1);
 		}
-			
+
 		i=snprintf(p,len,"{\"tag\":\"%.*s\",\"contact\":\"%.*s\",\"cseq\":\"%.*s\",\"route_set\":\"%.*s\",\"bind_addr\":\"%.*s\",\"sdp\":\"%.*s\"}",
 		dlg->legs[j].tag.len,dlg->legs[j].tag.s,
 		dlg->legs[j].contact.len,dlg->legs[j].contact.s,
@@ -1995,7 +2316,7 @@ static char *dlg_get_json_out(struct dlg_cell *dlg,int ctx,int *out_len)
 			LM_ERR("Failed to print dlg json \n");
 			return NULL;
 		}
-		
+
 		p+=i;
 		DEC_AND_CHECK_LEN(len,i);
 	}
@@ -2018,7 +2339,7 @@ static char *dlg_get_json_out(struct dlg_cell *dlg,int ctx,int *out_len)
 						continue;
 
 			if (k!=0) {
-				*p++ = ','; 
+				*p++ = ',';
 				DEC_AND_CHECK_LEN(len,1);
 			}
 			k++;
@@ -2092,7 +2413,7 @@ static char *dlg_get_json_out(struct dlg_cell *dlg,int ctx,int *out_len)
 			dl->it_marker=1;
 
 			if (dl!=dlg->profile_links) {
-				*p++ = ','; 
+				*p++ = ',';
 				DEC_AND_CHECK_LEN(len,1);
 			}
 
@@ -2104,7 +2425,7 @@ static char *dlg_get_json_out(struct dlg_cell *dlg,int ctx,int *out_len)
 			p+=dl->profile->name.len;
 
 			*p++='\"';
-			*p++=':';	
+			*p++=':';
 
 			*p++='[';
 
@@ -2143,7 +2464,7 @@ static char *dlg_get_json_out(struct dlg_cell *dlg,int ctx,int *out_len)
 	*p++='}';
 
 	*out_len = (int)(p-dlg_info);
-	return dlg_info;	
+	return dlg_info;
 }
 
 int pv_get_dlg_json(struct sip_msg *msg, pv_param_t *param,
@@ -2158,7 +2479,7 @@ int pv_get_dlg_json(struct sip_msg *msg, pv_param_t *param,
 
 	if ( (dlg=get_current_dialog())==NULL )
 		return pv_get_null( msg, param, res);
-	
+
 	dlg_lock_dlg(dlg);
 
 	if ((out = dlg_get_json_out(dlg,0,&len)) == NULL) {
@@ -2249,7 +2570,7 @@ static int w_get_dlg_jsons_by_val(struct sip_msg *msg, str *attr, pv_spec_t *att
 						dlg_unlock( d_table, d_entry);
 						return -1;
 					} else
-						n++; 
+						n++;
 				}
 			}
 		}
@@ -2293,7 +2614,7 @@ static int w_get_dlg_jsons_by_profile(struct sip_msg *msg, str *attr, str *attr_
 		LM_ERR("NO such profile <%.*s> \n",attr->len,attr->s);
 		return -1;
 	}
-	
+
 
 	/* go through all hash entries (entire table) */
 
@@ -2316,7 +2637,7 @@ static int w_get_dlg_jsons_by_profile(struct sip_msg *msg, str *attr, str *attr_
 			while(cur_link) {
 				if (cur_link->profile == profile &&
 				( !attr_val || !profile->has_value ||
-				( attr_val->len == cur_link->value.len && 
+				( attr_val->len == cur_link->value.len &&
 				!strncmp(attr_val->s,cur_link->value.s, attr_val->len)))) {
 					found = 1;
 					break;
@@ -2339,7 +2660,7 @@ static int w_get_dlg_jsons_by_profile(struct sip_msg *msg, str *attr, str *attr_
 						dlg_unlock( d_table, d_entry);
 						return -1;
 					} else
-						n++; 
+						n++;
 				}
 			}
 		}
@@ -2409,10 +2730,11 @@ static int fixup_leg(void **param)
 }
 
 
-static int load_dlg_ctx(struct sip_msg *msg, str *callid, void *lmode)
+static int load_dlg_ctx(struct sip_msg *msg, str *callid, void *lmode, int *active)
 {
 	struct dlg_cell *dlg = NULL;
 	int mode;
+	int active_only = (active?*active:0);
 
 	if (lmode)
 		mode = (int)(long)lmode;
@@ -2427,12 +2749,12 @@ static int load_dlg_ctx(struct sip_msg *msg, str *callid, void *lmode)
 	switch (mode) {
 		case DLG_CTX_LOAD_BY_CALLID:
 			/* callid */
-			dlg = get_dlg_by_callid( callid, 0 );
+			dlg = get_dlg_by_callid( callid, active_only );
 			break;
 
 		case DLG_CTX_LOAD_BY_DID:
 			/* did */
-			dlg = get_dlg_by_did( callid, 0);
+			dlg = get_dlg_by_did( callid, active_only );
 			break;
 	}
 
@@ -2566,6 +2888,10 @@ static int dlg_send_sequential(struct sip_msg* msg, str *method, int leg,
 {
 	struct dlg_cell *dlg = get_current_dialog();
 	str invite = str_init("INVITE");
+	str prack = str_init("PRACK");
+	str req_headers = {0, 0};
+	int rc;
+	int is_prack = 0;
 
 	if (!dlg) {
 		LM_WARN("no current dialog found. Make sure you call this "
@@ -2574,13 +2900,37 @@ static int dlg_send_sequential(struct sip_msg* msg, str *method, int leg,
 	}
 	if (!method)
 		method = &invite;
+	else if (method->len == prack.len && strncasecmp(method->s, prack.s, prack.len) == 0)
+		is_prack = 1;
 
 	if (body && !ct)
 		LM_WARN("body without content type! This request might be rejected by uac!\n");
 
-	return send_indialog_request(dlg, method, (leg == DLG_CALLER_LEG?leg:callee_idx(dlg)),
-			body, ct, headers, NULL, NULL, NULL) == 0?1:-1;
+	if (is_prack) {
+		rc = dlg_prepare_prack_headers(msg, headers, &req_headers, 0);
+		if (rc < 0)
+			return rc;
+	}
 
+	if (is_prack && msg && msg->first_line.type == SIP_REPLY) {
+		if (leg != DLG_CALLER_LEG) {
+			rc = dlg_ensure_reply_leg(dlg, msg);
+			if (rc > 0)
+				leg = rc;
+		}
+		rc = send_prack_indialog_request(dlg, msg,
+				leg, body, ct,
+				(req_headers.s ? &req_headers : headers), NULL, NULL, NULL);
+	} else
+		rc = send_indialog_request(dlg, method,
+				(leg == DLG_CALLER_LEG ? leg : callee_idx(dlg)),
+				body, ct, (req_headers.s ? &req_headers : headers),
+				NULL, NULL, NULL);
+
+	if (req_headers.s)
+		pkg_free(req_headers.s);
+
+	return rc == 0 ? 1 : -1;
 }
 
 static int dlg_inc_cseq(struct sip_msg *msg, str *tag, int *_count)

@@ -188,12 +188,21 @@ void sys_free(void *, const char *, const char *, unsigned int);
 #ifndef SYSTEM_MALLOC
 #define SYSTEM_MALLOC
 #endif
+#ifdef DBG_MALLOC
 #define pkg_malloc_func sys_malloc
 #define pkg_malloc(s) sys_malloc((s), __FILE__, __FUNCTION__, __LINE__)
-#define func_pkg_relloc sys_realloc
+#define pkg_realloc_func sys_realloc
 #define pkg_realloc(ptr, s) sys_realloc((ptr), (s), __FILE__, __FUNCTION__, __LINE__)
 #define pkg_free_func sys_free
 #define pkg_free(p) sys_free((p), __FILE__, __FUNCTION__, __LINE__)
+#else /* DBG_MALLOC */
+#define pkg_malloc_func malloc
+#define pkg_malloc(s) malloc((s))
+#define pkg_realloc_func realloc
+#define pkg_realloc(ptr, s) realloc((ptr), (s))
+#define pkg_free_func free
+#define pkg_free(p) free((p))
+#endif /* DBG_MALLOC */
 #define pkg_status()
 #define PKG_GET_SIZE()
 #define PKG_GET_USED()
@@ -206,5 +215,26 @@ void sys_free(void *, const char *, const char *, unsigned int);
 int init_pkg_mallocs();
 int init_shm_mallocs();
 int init_dbg_shm_mallocs();
+
+/* Thread-safe wrappers for process-private memory operations. */
+#ifdef DBG_MALLOC
+void *thread_malloc_dbg(size_t size, const char *file,
+	const char *function, unsigned int line);
+void *thread_realloc_dbg(void *ptr, size_t size, const char *file,
+	const char *function, unsigned int line);
+void thread_free_dbg(void *ptr, const char *file,
+	const char *function, unsigned int line);
+
+#define thread_malloc(_size) \
+	thread_malloc_dbg((_size), __FILE__, __FUNCTION__, __LINE__)
+#define thread_realloc(_ptr, _size) \
+	thread_realloc_dbg((_ptr), (_size), __FILE__, __FUNCTION__, __LINE__)
+#define thread_free(_ptr) \
+	thread_free_dbg((_ptr), __FILE__, __FUNCTION__, __LINE__)
+#else
+void *thread_malloc(size_t size);
+void *thread_realloc(void *ptr, size_t size);
+void thread_free(void *ptr);
+#endif
 
 #endif

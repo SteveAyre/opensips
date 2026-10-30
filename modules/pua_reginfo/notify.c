@@ -82,7 +82,7 @@ int process_contact(udomain_t *domain, urecord_t **ul_record, str aor,
 			case EVENT_REFRESHED:
 				/* In case, no record exists and new one should be created,
 				 * create a new entry for this user in the usrloc-DB */
-				if(ul.insert_urecord(domain, &aor, ul_record, 0) < 0) {
+				if(ul.insert_urecord(domain, &aor, ul_record, 0, NULL, NULL) < 0) {
 					LM_ERR("failed to insert new user-record\n");
 					ret = RESULT_ERROR;
 					goto done;
@@ -245,9 +245,6 @@ int process_body(str notify_body, udomain_t *domain)
 	ucontact_t *ul_contact = NULL;
 	struct sip_uri parsed_aor;
 
-	/* Temporary */
-	int mem_only = 1;
-
 	uri[0] = '\0';
 	doc = xmlParseMemory(notify_body.s, notify_body.len);
 	if(doc == NULL) {
@@ -311,11 +308,7 @@ int process_body(str notify_body, udomain_t *domain)
 			if(ul_record) {
 				ul_contact = ul_record->contacts;
 				while(ul_contact) {
-					if(mem_only) {
-						ul_contact->flags |= FL_MEM;
-					} else {
-						ul_contact->flags &= ~FL_MEM;
-					}
+					ul_contact->flags |= FL_MEM;
 					ul_contact = ul_contact->next;
 				}
 

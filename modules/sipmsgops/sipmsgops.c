@@ -48,6 +48,7 @@
 #include "../../parser/parse_from.h"
 #include "../../parser/parse_rr.h"
 #include "../../parser/sdp/sdp.h"
+#include "../../parser/sdp/sdp_helpr_funcs.h"
 #include "../../parser/contact/parse_contact.h"
 #include "../../parser/digest/digest.h"
 #include "../../msg_translator.h"
@@ -57,6 +58,7 @@
 
 #include "codecs.h"
 #include "list_hdr.h"
+#include "sdp_ops.h"
 #include "uri.h"
 
 #include <stdio.h>
@@ -78,8 +80,19 @@
 #define TIME_FORMAT "Date: %a, %d %b %Y %H:%M:%S GMT"
 #define MAX_TIME 64
 
-#define AUDIO_STR "audio"
-#define AUDIO_STR_LEN 5
+#define MIME_IS_UNKNOWN(type) \
+	(((type) >> 16) == TYPE_UNKNOWN || ((type) & 0xffff) == SUBTYPE_UNKNOWN)
+
+struct mime_param {
+	unsigned int type;
+	str str;
+};
+
+/* Compare a MIME parameter with a decoded type and a str pointer. */
+#define COMPARE_MIMES(_mime, _type, _str) \
+	((MIME_IS_UNKNOWN((_mime)->type) || MIME_IS_UNKNOWN(_type)) ? \
+		str_strcasecmp(&(_mime)->str, (_str)) == 0 : \
+		(_mime)->type == (_type))
 
 static int remove_hf(struct sip_msg* msg, int_str_t* hf);
 static int remove_hf_re(struct sip_msg* msg, regex_t* re);
@@ -94,13 +107,15 @@ static int insert_hf(struct sip_msg *msg, str *str1, void *str2);
 static int append_urihf(struct sip_msg *msg, str *str1, str *str2);
 static int append_time_f(struct sip_msg* msg, char* , char *);
 static int is_method_f(struct sip_msg *msg, void *meth);
-static int has_body_f(struct sip_msg *msg, void *type);
+static int has_body_f(struct sip_msg *msg, struct mime_param *mime);
 static int is_privacy_f(struct sip_msg *msg, void *privacy);
-static int remove_body_part_f(struct sip_msg *msg, void *type, void *revert);
+static int remove_body_part_f(struct sip_msg *msg, struct mime_param *mime,
+	void *revert);
 static int add_body_part_f(struct sip_msg *msg, str *body, str *mime,
-                           str *extra_hdrs);
-static int get_updated_body_part_f(struct sip_msg *msg, int *type,pv_spec_t* out);
-static int is_audio_on_hold_f(struct sip_msg *msg);
+	str *extra_hdrs);
+static int get_updated_body_part_f(struct sip_msg *msg,
+	struct mime_param *mime,pv_spec_t* out);
+static int w_is_audio_on_hold(struct sip_msg *msg);
 static int w_sip_validate(struct sip_msg *msg, void *flags, pv_spec_t* err_txt);
 static int w_sip_to_json(struct sip_msg *msg, pv_spec_t* out_json);
 
@@ -171,12 +186,12 @@ static const cmd_export_t cmds[]={
 		REQUEST_ROUTE|ONREPLY_ROUTE|FAILURE_ROUTE|BRANCH_ROUTE|LOCAL_ROUTE},
 
 	{"has_body",         (cmd_function)has_body_f, {
-		{CMD_PARAM_STR|CMD_PARAM_OPT, fixup_mime_type, 0},
+		{CMD_PARAM_STR|CMD_PARAM_OPT, fixup_mime_type, fixup_free_pkg},
 		{0, 0, 0}},
 		REQUEST_ROUTE|ONREPLY_ROUTE|FAILURE_ROUTE|BRANCH_ROUTE|LOCAL_ROUTE},
 
 	{"has_body_part",    (cmd_function)has_body_f, {
-		{CMD_PARAM_STR|CMD_PARAM_OPT, fixup_mime_type, 0},
+		{CMD_PARAM_STR|CMD_PARAM_OPT, fixup_mime_type, fixup_free_pkg},
 		{0, 0, 0}},
 		REQUEST_ROUTE|ONREPLY_ROUTE|FAILURE_ROUTE|BRANCH_ROUTE|LOCAL_ROUTE},
 
@@ -185,7 +200,7 @@ static const cmd_export_t cmds[]={
 		REQUEST_ROUTE|ONREPLY_ROUTE|FAILURE_ROUTE|BRANCH_ROUTE|LOCAL_ROUTE},
 
 	{"remove_body_part", (cmd_function)remove_body_part_f, {
-		{CMD_PARAM_STR|CMD_PARAM_OPT, fixup_mime_type, 0},
+		{CMD_PARAM_STR|CMD_PARAM_OPT, fixup_mime_type, fixup_free_pkg},
 		{CMD_PARAM_STR|CMD_PARAM_OPT, fixup_revert, 0}, {0, 0, 0}},
 		REQUEST_ROUTE|ONREPLY_ROUTE|FAILURE_ROUTE|BRANCH_ROUTE|LOCAL_ROUTE },
 
@@ -196,7 +211,7 @@ static const cmd_export_t cmds[]={
 		REQUEST_ROUTE|ONREPLY_ROUTE|FAILURE_ROUTE|BRANCH_ROUTE|LOCAL_ROUTE},
 
 	{"get_updated_body_part",    (cmd_function)get_updated_body_part_f, {
-		{CMD_PARAM_STR|CMD_PARAM_OPT, fixup_mime_type, 0},
+		{CMD_PARAM_STR|CMD_PARAM_OPT, fixup_mime_type, fixup_free_pkg},
 		{CMD_PARAM_VAR, 0, 0}, {0, 0, 0}},
 		REQUEST_ROUTE|ONREPLY_ROUTE|FAILURE_ROUTE|BRANCH_ROUTE|LOCAL_ROUTE},
 
@@ -240,7 +255,7 @@ static const cmd_export_t cmds[]={
 		{CMD_PARAM_REGEX, 0, 0}, {0, 0, 0}},
 		REQUEST_ROUTE|ONREPLY_ROUTE|FAILURE_ROUTE|BRANCH_ROUTE|LOCAL_ROUTE},
 
-	{"is_audio_on_hold",    (cmd_function)is_audio_on_hold_f, {{0, 0, 0}},
+	{"is_audio_on_hold",    (cmd_function)w_is_audio_on_hold, {{0, 0, 0}},
 		REQUEST_ROUTE|ONREPLY_ROUTE|FAILURE_ROUTE|BRANCH_ROUTE|LOCAL_ROUTE},
 
 	{"sipmsg_validate",     (cmd_function)w_sip_validate, {
@@ -859,28 +874,39 @@ static int fixup_mime_type(void** param)
 	char *p;
 	char *r;
 	unsigned int type;
-	str *mime = (str *)*param;
+	str *s = (str *)*param;
+	struct mime_param *mime;
 
-	if (!mime)
+	if (!s)
 		return 0;
 
-	p = mime->s;
+	trim(s);
+	p = s->s;
 
-	if (p==0 || p[0]==0) {
+	if (p==0 || s->len==0 || p[0]==0) {
 		type = 0;
 	} else {
-		r = decode_mime_type( p, p + mime->len , &type , NULL);
+		r = decode_mime_type( p, p + s->len , &type , NULL);
 		if (r==0) {
 			LM_ERR("unsupported mime <%s>\n",p);
 			return E_CFG;
 		}
-		if ( r!=p + mime->len ) {
+		if ( r!=p + s->len ) {
 			LM_ERR("multiple mimes not supported!\n");
 			return E_CFG;
 		}
 	}
 
-	*param = (void*)(long)type;
+	mime = pkg_malloc(sizeof(*mime));
+	if (!mime) {
+		LM_ERR("no pkg memory left\n");
+		return E_OUT_OF_MEM;
+	}
+	mime->type = type;
+	/* The script parser owns the string for the lifetime of the script. */
+	mime->str = *s;
+
+	*param = mime;
 	return 0;
 }
 
@@ -897,7 +923,7 @@ static int fixup_revert(void** param)
 }
 
 
-static int has_body_f(struct sip_msg *msg, void *type)
+static int has_body_f(struct sip_msg *msg, struct mime_param *mime)
 {
 	struct body_part * p;
 
@@ -913,18 +939,18 @@ static int has_body_f(struct sip_msg *msg, void *type)
 		}
 	}
 
-	if( ( ((int)(long)type )>>16) == TYPE_MULTIPART )
+	if (mime && (mime->type >> 16) == TYPE_MULTIPART)
 	{
-		int mime = parse_content_type_hdr(msg);
+		int type = parse_content_type_hdr(msg);
 
-		if( mime == ((int)(long)type ) )
-			return 1;
+		if (type <= 0)
+			return -1;
 
-		return -1;
+		return COMPARE_MIMES(mime, type, &msg->content_type->body) ? 1 : -1;
 	}
 
 	/* check type also? */
-	if (type==0)
+	if (mime==NULL || mime->type==0)
 		return 1;
 
 	if (parse_sip_body(msg)<0 || msg->body==NULL) {
@@ -935,7 +961,7 @@ static int has_body_f(struct sip_msg *msg, void *type)
 	p = &msg->body->first;
 	while (p)
 	{
-		if( p->mime == ((int)(long)type ) )
+		if (COMPARE_MIMES(mime, p->mime, &p->mime_s))
 			return 1;
 		p = p->next;
 	}
@@ -954,11 +980,13 @@ static int is_privacy_f(struct sip_msg *msg, void *privacy)
 }
 
 
-static int remove_body_part_f(struct sip_msg *msg, void *type, void *revert)
+static int remove_body_part_f(struct sip_msg *msg, struct mime_param *mime,
+																void *revert)
 {
 	struct sip_msg_body * b;
 	struct body_part * p;
 	int deleted = 0;
+	int match;
 
 	if (parse_sip_body(msg)<0 || (b=msg->body)==NULL) {
 		LM_DBG("no body found\n");
@@ -970,8 +998,15 @@ static int remove_body_part_f(struct sip_msg *msg, void *type, void *revert)
 
 	for ( p=&b->first ; p ; p=p->next) {
 
-		if ( (type==NULL) || ( !revert && (p->mime==((int)(long)type)) )
-		|| ( revert && (p->mime!=((int)(long)type)) ) ) {
+		if (mime==NULL || mime->type==0) {
+			match = 1;
+		} else {
+			match = COMPARE_MIMES(mime, p->mime, &p->mime_s);
+			if (revert)
+				match = !match;
+		}
+
+		if (match) {
 			delete_body_part( msg, p);
 			deleted =  1;
 		}
@@ -1013,7 +1048,8 @@ static int add_body_part_f(struct sip_msg *msg, str *body, str *mime,
  *	Function to apply all pending changes over a body part and
  *	return the result into a variable
  * */
-static int get_updated_body_part_f(struct sip_msg *msg, int *type, pv_spec_t* res)
+static int get_updated_body_part_f(struct sip_msg *msg,
+									struct mime_param *mime, pv_spec_t* res)
 {
 	static str out = {NULL, 0};
 	struct body_part *p = NULL, *it;
@@ -1027,12 +1063,12 @@ static int get_updated_body_part_f(struct sip_msg *msg, int *type, pv_spec_t* re
 	}
 
 
-	if (type) {
+	if (mime && mime->type) {
 
 		p = &msg->body->first;
 		while (p) {
 			if ( (p->flags&SIP_BODY_PART_FLAG_DELETED) == 0
-			&& p->mime == ((int)(long)type) )
+			&& COMPARE_MIMES(mime, p->mime, &p->mime_s) )
 				break;
 
 			p = p->next;
@@ -1086,7 +1122,7 @@ static int get_updated_body_part_f(struct sip_msg *msg, int *type, pv_spec_t* re
 	}
 
 
-	if (type) {
+	if (mime && mime->type) {
 
 		/* restore the correct DELETED flag */
 		for (it = &msg->body->first ; it ; it=it->next)
@@ -1110,35 +1146,6 @@ static int get_updated_body_part_f(struct sip_msg *msg, int *type, pv_spec_t* re
 	}
 
 	return 1;
-}
-
-
-static int is_audio_on_hold_f(struct sip_msg *msg)
-{
-	int sdp_session_num = 0, sdp_stream_num;
-	sdp_session_cell_t* sdp_session;
-	sdp_stream_cell_t* sdp_stream;
-	sdp_info_t* sdp;
-
-	if ( (sdp=parse_sdp(msg))!=NULL ) {
-		for(;;) {
-			sdp_session = get_sdp_session(sdp, sdp_session_num);
-			if(!sdp_session) break;
-			sdp_stream_num = 0;
-			for(;;) {
-				sdp_stream = get_sdp_stream(sdp, sdp_session_num,
-					sdp_stream_num);
-				if(!sdp_stream) break;
-				if(sdp_stream->media.len==AUDIO_STR_LEN &&
-						strncmp(sdp_stream->media.s,AUDIO_STR,AUDIO_STR_LEN)==0 &&
-						sdp_stream->is_on_hold)
-					return sdp_stream->is_on_hold;
-				sdp_stream_num++;
-			}
-			sdp_session_num++;
-		}
-	}
-	return -1;
 }
 
 
@@ -1579,6 +1586,7 @@ static int check_hostname(str *domain)
 #define MAX_REASON 256
 
 enum sip_validation_failures {
+	SV_NO_ERROR=0,
 	SV_NO_MSG=-1,
 	SV_HDR_PARSE_ERROR=-2,
 	SV_NO_CALLID=-3,
@@ -1608,23 +1616,91 @@ enum sip_validation_failures {
 	SV_BAD_USERNAME=-27,
 	SV_FROM_USERNAME_ERROR=-28,
 	SV_TO_USERNAME_ERROR=-29,
+	SV_BAD_STAR_CONTACT=-30,
 	SV_GENERIC_FAILURE=-255
 };
 
+#define METHOD_WITH_CONTACT_HDR (METHOD_INVITE | METHOD_REGISTER | METHOD_UPDATE | METHOD_SUBSCRIBE | METHOD_REFER)
+
+static enum sip_validation_failures validate_contact_header(struct sip_msg *msg, enum request_method method, char reason[static MAX_REASON])
+{
+	struct hdr_field *ptr = NULL;
+	contact_t * contacts = NULL;
+	exp_body_t *expires_body = NULL;
+	struct sip_uri test_contacts;
+
+	if (method & METHOD_WITH_CONTACT_HDR) {
+		if (!msg->contact) {
+			strcpy(reason, "SIP message doesn't have 'Contact' header");
+			return SV_NO_CONTACT;
+		}
+
+		/* iterate through Contact headers */
+		for(ptr = msg->contact; ptr; ptr = ptr->sibling) {
+			/* parse Contact header */
+			if (!ptr->parsed && (parse_contact(ptr) < 0
+						|| !ptr->parsed)) {
+				strcpy(reason, "failed to parse 'Contact' header");
+				return SV_CONTACT_PARSE_ERROR;
+			}
+			contacts = ((contact_body_t*)ptr->parsed)->contacts;
+
+			if (contacts != NULL) {
+				/* iterate through URIs and check validty */
+				for (; contacts; contacts = contacts->next) {
+					if(parse_uri(contacts->uri.s, contacts->uri.len,
+								&test_contacts) < 0
+							|| test_contacts.host.len < 0) {
+						strcpy(reason, "failed to parse 'Contact' header");
+						return SV_CONTACT_PARSE_ERROR;
+					}
+				}
+			} else {
+				/* This is a star Contact header, valid only for REGISTER requests */
+				if (method == METHOD_REGISTER) {
+					if (msg->first_line.type == SIP_REPLY) {
+						strcpy(reason, "'Contact' header for REGISTER reply contains '*' only valid for REGISTER request");
+						return SV_BAD_STAR_CONTACT;
+					}
+
+					if (!msg->expires || (parse_expires(msg->expires) < 0 || !msg->expires->parsed)) {
+						strcpy(reason, "failed to parse 'Expires' header");
+						return SV_BAD_STAR_CONTACT;
+					}
+
+					expires_body = (exp_body_t*) msg->expires->parsed;
+
+					if (!expires_body || expires_body->val != 0) {
+						strcpy(reason, "'Expires' header greater than 0 for REGISTER 'Contact' header with '*' value");
+						return SV_BAD_STAR_CONTACT;
+					}
+				} else {
+					strcpy(reason, "'Contact' header for SIP message contains '*' only valid for REGISTER request");
+					return SV_BAD_STAR_CONTACT;
+				}
+			}
+		}
+	}
+
+	return SV_NO_ERROR;
+}
+
+static int w_is_audio_on_hold(struct sip_msg *msg)
+{
+	return is_audio_on_hold(msg) ? 1 : -1;
+}
+
 static int w_sip_validate(struct sip_msg *msg, void *_flags, pv_spec_t* err_txt)
 {
-	unsigned int hdrs_len;
+	unsigned int hdrs_len, status_code;
 	unsigned long flags = (unsigned long)_flags;
 	int method;
 	str body;
-	struct hdr_field * ptr;
-	contact_t * contacts;
-	struct sip_uri test_contacts;
 	struct sip_uri *p_uri;
 	struct cseq_body * cbody;
 	pv_value_t pv_val;
 	char reason[MAX_REASON];
-	int ret = -SV_GENERIC_FAILURE;
+	int ret;
 
 	if (!msg) {
 		strcpy(reason, "no message object");
@@ -1783,38 +1859,11 @@ static int w_sip_validate(struct sip_msg *msg, void *_flags, pv_spec_t* err_txt)
 				CHECK_HEADER("", maxforwards);
 			}
 
-			if (msg->REQ_METHOD == METHOD_INVITE) {
-				ret = SV_NO_CONTACT;
-				CHECK_HEADER("INVITE", contact);
-				if(flags & SIP_PARSE_CONTACT) {
-					/* iterate through Contact headers */
-					for(ptr = msg->contact; ptr; ptr = ptr->sibling) {
-						/* parse Contact header */
-						if(!ptr->parsed && (parse_contact(ptr) < 0
-									|| !ptr->parsed)) {
-							strcpy(reason, "failed to parse 'Contact' header");
-							ret = SV_CONTACT_PARSE_ERROR;
-							goto failed;
-						}
-						contacts = ((contact_body_t*)ptr->parsed)->contacts;
-						/* empty contacts header - something must be wrong */
-						if(contacts == NULL) {
-							strcpy(reason, "empty body for 'Contact' header");
-							ret = SV_CONTACT_PARSE_ERROR;
-							goto failed;
-						}
-						/* iterate through URIs and check validty */
-						for(; contacts; contacts = contacts->next) {
-							if(parse_uri(contacts->uri.s, contacts->uri.len,
-										&test_contacts) < 0
-									|| test_contacts.host.len < 0) {
-								strcpy(reason, "failed to parse 'Contact' header");
-								ret = SV_CONTACT_PARSE_ERROR;
-								goto failed;
-							}
-						}
-					}
+			if (flags & SIP_PARSE_CONTACT) {
+				ret = validate_contact_header(msg, msg->REQ_METHOD, reason);
 
+				if (ret != SV_NO_ERROR) {
+					goto failed;
 				}
 			}
 
@@ -1837,8 +1886,9 @@ static int w_sip_validate(struct sip_msg *msg, void *_flags, pv_spec_t* err_txt)
 				goto failed;
 			}
 			method = cbody->method_id;
+			status_code = msg->first_line.u.reply.statuscode;
 			if (method != METHOD_CANCEL) {
-				switch (msg->first_line.u.reply.statuscode) {
+				switch (status_code) {
 					case 405:
 						ret = SV_NOALLOW_405;
 						CHECK_HEADER("", allow);
@@ -1868,6 +1918,14 @@ static int w_sip_validate(struct sip_msg *msg, void *_flags, pv_spec_t* err_txt)
 				}
 			}
 
+			if (flags & SIP_PARSE_CONTACT && (status_code > 199 && status_code < 400)) {
+				ret = validate_contact_header(msg, method, reason);
+
+				if (ret != 0) {
+					goto failed;
+				}
+			}
+
 			break;
 
 		default:
@@ -1892,7 +1950,6 @@ static int w_sip_validate(struct sip_msg *msg, void *_flags, pv_spec_t* err_txt)
 		else {
 			/* no body */
 			body.s = NULL;
-			body.len = 0;
 		}
 
 		/* determine the length of the body */
@@ -2102,6 +2159,10 @@ static int w_sip_to_json(struct sip_msg *msg, pv_spec_t* out_json)
 	}
 
 	for (it=msg->headers;it;it=it->next) {
+		if (it->name.len >= sizeof(hdr_name_buf)) {
+			LM_WARN("header name too long (%d), skipping\n", it->name.len);
+			continue;
+		}
 		memcpy(hdr_name_buf,it->name.s,it->name.len);
 		hdr_name_buf[it->name.len] = 0;
 

@@ -27,6 +27,7 @@
 #define globals_h
 
 #include <time.h>
+#include "str.h"
 
 typedef struct __str * const strptr_t;
 
@@ -40,6 +41,7 @@ extern char * cfg_file;
 extern char *preproc;
 extern int config_check;
 extern char *stat_file;
+extern str pi_framework;
 
 extern char* pid_file;
 extern char* pgid_file;
@@ -66,6 +68,7 @@ extern int tcp_socket_backlog;
 extern int tcp_max_fd_no;
 extern int tcp_max_connections;
 extern int tcp_keepalive;
+extern int reactor_dbg_fd_check;
 extern int tcp_keepcount;
 extern int tcp_keepidle;
 extern int tcp_keepinterval;
@@ -73,7 +76,7 @@ extern int tcp_max_msg_time;
 extern int tcp_no_new_conn;
 extern int tcp_no_new_conn_bflag;
 extern int tcp_no_new_conn_rplflag;
-extern int tcp_parallel_read_on_workers;
+extern int tcp_threads;
 extern struct tcp_conn_profile tcp_con_df_profile;
 
 extern int no_daemon_mode;

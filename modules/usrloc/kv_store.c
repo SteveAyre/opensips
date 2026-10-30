@@ -103,6 +103,8 @@ void kv_del(map_t _store, const str* _key)
 
 	if (val->is_str)
 		shm_free(val->s.s);
+
+	shm_free(val);
 }
 
 static int push_kv_to_json(void *param, str key, void *value)
@@ -183,6 +185,9 @@ map_t store_deserialize(const str *input)
 		LM_ERR("oom\n");
 		return NULL;
 	}
+
+	if (ZSTRP(input))
+		return map;
 
 	cJSON_InitHooks(&shm_hooks);
 

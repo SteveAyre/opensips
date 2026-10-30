@@ -272,7 +272,6 @@ int trace_rest_request_cb(CURL *handle, curl_infotype type, char *data, size_t s
 	} else if ( type == CURLINFO_DATA_IN || type == CURLINFO_DATA_OUT ){
 		if ( size > 0) {
 			if ( is_req ) {
-				/* request data */
 				tparam->req_len = snprintf( tparam->req_body, BODY_MAX, "%.*s", (int)size, data);
 				if ( tparam->req_len >= FLINE_MAX ) {
 					/* \0 in the end */
@@ -313,10 +312,9 @@ static inline char is_new_transfer(int fd)
 {
 	int it;
 
-	for (it = 0; it < transfers; it++) {
+	for (it = 0; it < transfers; it++)
 		if (fd == read_fds[it])
 			return 0;
-	}
 
 	return 1;
 }
@@ -343,6 +341,26 @@ static inline char del_transfer(int fd)
 	}
 
 	return -1;
+}
+
+/*
+ * guard against registering a non-socket fd. libcurl's
+ * internal wakeup eventfd can appear in curl_multi_fdset()'s read set
+ * alongside the real transfer socket (observed on 8.21.0, not 8.17.0);
+ * is_new_transfer() only checks fd numbers, not fd type.
+ *
+ * Note: CURLINFO_ACTIVESOCKET is not a usable alternative here - at this
+ * point the easy handle is fresh out of curl_easy_init(), so it always
+ * reads back CURL_SOCKET_BAD. A cleaner long-term fix would be adopting
+ * CURLMOPT_SOCKETFUNCTION, which reports fds with an explicit type instead
+ * of relying on fd_set scanning.
+ */
+static inline int rest_fd_is_socket(int fd)
+{
+	int type;
+	socklen_t len = sizeof(type);
+
+	return getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &len) == 0;
 }
 
 static OSS_CURLM *get_multi(void)
@@ -399,13 +417,13 @@ static inline int get_easy_status(CURL *handle, CURLM *multi, CURLcode *code)
 	return -1;
 }
 
-static int init_transfer(CURL *handle, char *url, unsigned long timeout_s)
+static int init_transfer(CURL *handle, char *url, unsigned long timeout_s, int max_redirects)
 {
 	CURLcode rc;
 
 	w_curl_easy_setopt(handle, CURLOPT_URL, url);
 	if (curl_http_version != CURL_HTTP_VERSION_NONE)
-		w_curl_easy_setopt(handle, CURLOPT_HTTP_VERSION, curl_http_version);
+		w_curl_easy_setopt(handle, CURLOPT_HTTP_VERSION, (long)curl_http_version);
 
 	if (tls_dom) {
 		w_curl_easy_setopt(handle, CURLOPT_SSLCERT, tls_dom->cert.s);
@@ -419,9 +437,19 @@ static int init_transfer(CURL *handle, char *url, unsigned long timeout_s)
 	w_curl_easy_setopt(handle, CURLOPT_TIMEOUT,
 			timeout_s && timeout_s < curl_timeout ? timeout_s : curl_timeout);
 
-	w_curl_easy_setopt(handle, CURLOPT_VERBOSE, 1);
-	w_curl_easy_setopt(handle, CURLOPT_STDERR, stdout);
-	w_curl_easy_setopt(handle, CURLOPT_FAILONERROR, 0);
+	w_curl_easy_setopt(handle, CURLOPT_VERBOSE, 0L);
+	w_curl_easy_setopt(handle, CURLOPT_FAILONERROR, 0L);
+
+	if (max_redirects > 0) {
+		w_curl_easy_setopt(handle, CURLOPT_FOLLOWLOCATION, 1L);
+		w_curl_easy_setopt(handle, CURLOPT_MAXREDIRS, (long)max_redirects);
+#if LIBCURL_VERSION_NUM >= 0x075500 /* 7.85.0 */
+		w_curl_easy_setopt(handle, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+#else
+		w_curl_easy_setopt(handle, CURLOPT_REDIR_PROTOCOLS,
+				(long)(CURLPROTO_HTTP | CURLPROTO_HTTPS));
+#endif
+	}
 
 	if (ssl_capath)
 		w_curl_easy_setopt(handle, CURLOPT_CAPATH, ssl_capath);
@@ -477,7 +505,7 @@ static inline int set_upload_opts(CURL *handle, str *ctype, str *body)
 	 *	   strings (e.g. $du), thus curl's strlen() may overflow or crash
 	 */
 #if (LIBCURL_VERSION_NUM >= 0x071101)
-	w_curl_easy_setopt(handle, CURLOPT_POSTFIELDSIZE, body->len);
+	w_curl_easy_setopt(handle, CURLOPT_POSTFIELDSIZE, (long)body->len);
 	w_curl_easy_setopt(handle, CURLOPT_COPYPOSTFIELDS, body->s);
 #else
 	w_curl_easy_setopt(handle, CURLOPT_POSTFIELDS, body->s);
@@ -490,7 +518,7 @@ cleanup:
 
 #define set_post_opts(handle, ctype, body) \
 	do { \
-		w_curl_easy_setopt(handle, CURLOPT_POST, 1); \
+		w_curl_easy_setopt(handle, CURLOPT_POST, 1L); \
 		if (set_upload_opts(handle, ctype, body) != 0) { \
 			LM_ERR("failed to init POST to %s\n", url); \
 			goto cleanup; \
@@ -694,7 +722,8 @@ static inline char rest_easy_perform(
  */
 int rest_sync_transfer(enum rest_client_method method, struct sip_msg *msg,
           /* in */    char *url, str *body, str *ctype,
-          /* out */   pv_spec_p body_pv, pv_spec_p ctype_pv, pv_spec_p code_pv)
+          /* out */   pv_spec_p body_pv, pv_spec_p ctype_pv, pv_spec_p code_pv,
+          /* in */    int max_redirects)
 {
 	int ret;
 	CURLcode rc;
@@ -704,7 +733,7 @@ int rest_sync_transfer(enum rest_client_method method, struct sip_msg *msg,
 	str st = STR_NULL, res_body = STR_NULL, tbody, ttype;
 
 	curl_easy_reset(sync_handle);
-	if (init_transfer(sync_handle, url, 0) != 0) {
+	if (init_transfer(sync_handle, url, 0, max_redirects) != 0) {
 		LM_ERR("failed to init transfer to %s\n", url);
 		goto cleanup;
 	}
@@ -814,14 +843,14 @@ cleanup:
 int start_async_http_req(struct sip_msg *msg, enum rest_client_method method,
                          char *url, str *req_body, str *req_ctype,
                          rest_async_param *async_parm, str *body, str *ctype,
-						 enum async_ret_code *out_fd)
+                         enum async_ret_code *out_fd, int max_redirects)
 {
 	CURL *handle;
 	CURLcode rc;
 	CURLMcode mrc;
 	fd_set rset, wset, eset;
-	int max_fd, fd, http_rc, ret = RCL_INTERNAL_ERR;
-	long busy_wait, timeout, connect_timeout;
+	int max_fd, fd, ret = RCL_INTERNAL_ERR;
+	long http_rc, busy_wait, timeout, connect_timeout;
 	long retry_time;
 	OSS_CURLM *multi_list;
 	CURLM *multi_handle;
@@ -837,7 +866,7 @@ int start_async_http_req(struct sip_msg *msg, enum rest_client_method method,
 		goto cleanup;
 	}
 
-	if (init_transfer(handle, url, async_parm->timeout_s) != 0) {
+	if (init_transfer(handle, url, async_parm->timeout_s, max_redirects) != 0) {
 		LM_ERR("failed to init transfer to %s\n", url);
 		goto cleanup;
 	}
@@ -964,6 +993,8 @@ int start_async_http_req(struct sip_msg *msg, enum rest_client_method method,
 		}
 
 		FD_ZERO(&rset);
+		FD_ZERO(&wset);
+		FD_ZERO(&eset);
 		mrc = curl_multi_fdset(multi_handle, &rset, &wset, &eset, &max_fd);
 		if (mrc != CURLM_OK) {
 			LM_ERR("curl_multi_fdset: %s\n", curl_multi_strerror(mrc));
@@ -974,7 +1005,8 @@ int start_async_http_req(struct sip_msg *msg, enum rest_client_method method,
 			for (fd = 0; fd <= max_fd; fd++) {
 				if (FD_ISSET(fd, &rset)) {
 					LM_DBG("ongoing transfer on fd %d\n", fd);
-					if (connect > 0 && req_sz > 0 && is_new_transfer(fd)) {
+					if ((connect > 0 || req_sz > 0) && is_new_transfer(fd) &&
+							rest_fd_is_socket(fd)) {
 						LM_DBG(">>> add fd %d to ongoing transfers\n", fd);
 						add_transfer(fd);
 						goto success;
@@ -1114,6 +1146,8 @@ static enum async_ret_code _resume_async_http_req(int fd, struct sip_msg *msg,
 	}
 
 	FD_ZERO(&rset);
+	FD_ZERO(&wset);
+	FD_ZERO(&eset);
 	mrc = curl_multi_fdset(multi_handle, &rset, &wset, &eset, &max_fd);
 	if (mrc != CURLM_OK) {
 		LM_ERR("curl_multi_fdset: %s\n", curl_multi_strerror(mrc));
